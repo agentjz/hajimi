@@ -1,0 +1,11 @@
+dist
+node_modules
+.DS_Store
+.tmp-smoke
+.tmp-smoke-check-*
+coverage
+__pycache__/
+*.log
+*.tsbuildinfo
+.test-build/
+.test-tmp-*

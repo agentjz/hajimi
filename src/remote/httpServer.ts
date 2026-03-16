@@ -283,7 +283,7 @@ function resolveAssetContentType(name: string): string {
     return "text/css; charset=utf-8";
   }
 
-  if (name.endsWith(".js")) {
+  if (name.endsWith(".js") || name.endsWith(".mjs")) {
     return "text/javascript; charset=utf-8";
   }
 

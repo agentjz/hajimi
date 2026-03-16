@@ -163,6 +163,16 @@ test("remote HTTP page serves split assets and renders phased chat state", async
   assert.equal(mainModule.status, 200);
   assert.match(await mainModule.text(), /syncTimelineFromState/u);
 
+  const markedModule = await fetch(`${server.url}/assets/vendor/marked.esm.js`);
+  assert.equal(markedModule.status, 200);
+  assert.equal(markedModule.headers.get("content-type"), "text/javascript; charset=utf-8");
+  assert.match(await markedModule.text(), /marked/u);
+
+  const purifyModule = await fetch(`${server.url}/assets/vendor/purify.es.mjs`);
+  assert.equal(purifyModule.status, 200);
+  assert.equal(purifyModule.headers.get("content-type"), "text/javascript; charset=utf-8");
+  assert.match(await purifyModule.text(), /DOMPurify/u);
+
   const initialState = await fetch(`${server.url}/api/state`);
   assert.equal(initialState.status, 200);
 

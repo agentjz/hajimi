@@ -2,6 +2,18 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 const assetCache = new Map<string, string>();
+const VENDOR_ASSET_CANDIDATES: Record<string, string[]> = {
+  "vendor/marked.esm.js": [
+    "../node_modules/marked/lib/marked.esm.js",
+    "../../node_modules/marked/lib/marked.esm.js",
+    "../../../node_modules/marked/lib/marked.esm.js",
+  ],
+  "vendor/purify.es.mjs": [
+    "../node_modules/dompurify/dist/purify.es.mjs",
+    "../../node_modules/dompurify/dist/purify.es.mjs",
+    "../../../node_modules/dompurify/dist/purify.es.mjs",
+  ],
+};
 
 export async function loadRemoteAsset(name: string): Promise<string> {
   const cached = assetCache.get(name);
@@ -9,8 +21,7 @@ export async function loadRemoteAsset(name: string): Promise<string> {
     return cached;
   }
 
-  for (const directory of resolveAssetDirectories()) {
-    const assetPath = path.join(directory, name);
+  for (const assetPath of resolveAssetPaths(name)) {
     try {
       const content = await fs.readFile(assetPath, "utf8");
       assetCache.set(name, content);
@@ -23,6 +34,15 @@ export async function loadRemoteAsset(name: string): Promise<string> {
   }
 
   throw new Error(`Remote asset not found: ${name}`);
+}
+
+function resolveAssetPaths(name: string): string[] {
+  const moduleDir = __dirname;
+  const directAssetPaths = resolveAssetDirectories().map((directory) => path.join(directory, name));
+  const vendorAssetPaths = (VENDOR_ASSET_CANDIDATES[name] ?? []).map((relativePath) =>
+    path.resolve(moduleDir, relativePath),
+  );
+  return [...new Set([...directAssetPaths, ...vendorAssetPaths])];
 }
 
 function resolveAssetDirectories(): string[] {

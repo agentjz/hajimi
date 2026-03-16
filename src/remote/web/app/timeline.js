@@ -1,4 +1,5 @@
 import { ITEM_LABELS, formatClock } from "./constants.js";
+import { buildMarkdownNode } from "./markdown.js";
 
 export function buildMessageElement(item, options) {
   const wrapper = document.createElement("article");
@@ -57,38 +58,41 @@ function appendMessageBody(container, item, options) {
   }
 
   const useMonospace = item.kind === "reasoning";
+  const renderMarkdown = item.kind === "user" || item.kind === "final_answer";
   const collapseLimit = item.kind === "reasoning" ? 520 : 1200;
 
   if (!text.trim()) {
     const placeholder = document.createElement("p");
     placeholder.className = "message-text muted-text";
-    placeholder.textContent = item.kind === "reasoning" ? "这里暂时没有可显示的思考内容。" : "这里暂时没有可显示的内容。";
+    placeholder.textContent = item.kind === "reasoning"
+      ? "这里暂时没有可显示的思考内容。"
+      : "这里暂时没有可显示的内容。";
     container.appendChild(placeholder);
     return;
   }
 
   if (item.collapsed || text.length > collapseLimit) {
-    container.appendChild(buildCollapsibleText(item, text, useMonospace, collapseLimit, options));
+    container.appendChild(buildCollapsibleText(item, text, useMonospace, renderMarkdown, collapseLimit, options));
     return;
   }
 
-  container.appendChild(buildTextNode(text, useMonospace));
+  container.appendChild(buildBodyNode(text, useMonospace, renderMarkdown));
 }
 
-function buildCollapsibleText(item, text, useMonospace, previewLength, options) {
+function buildCollapsibleText(item, text, useMonospace, renderMarkdown, previewLength, options) {
   const wrapper = document.createElement("div");
   wrapper.className = "collapsible";
 
   const body = document.createElement("div");
   body.className = "collapsible-body";
-  body.appendChild(buildTextNode(text, useMonospace));
+  body.appendChild(buildBodyNode(text, useMonospace, renderMarkdown));
 
   const isOpen = options.expandedItems.has(item.id) || (!item.collapsed && text.length <= previewLength);
   const previewText = text.length > previewLength
     ? `${text.slice(0, previewLength).trimEnd()}\n...`
     : "点击展开查看详情";
 
-  const preview = buildTextNode(previewText, useMonospace);
+  const preview = buildPlainTextNode(previewText, useMonospace);
   preview.classList.add("collapsible-preview");
 
   const button = document.createElement("button");
@@ -108,7 +112,15 @@ function buildCollapsibleText(item, text, useMonospace, previewLength, options) 
   return wrapper;
 }
 
-function buildTextNode(text, useMonospace) {
+function buildBodyNode(text, useMonospace, renderMarkdown) {
+  if (renderMarkdown && !useMonospace) {
+    return buildMarkdownNode(text);
+  }
+
+  return buildPlainTextNode(text, useMonospace);
+}
+
+function buildPlainTextNode(text, useMonospace) {
   const node = document.createElement(useMonospace ? "pre" : "p");
   node.className = useMonospace ? "message-pre" : "message-text";
   node.textContent = text;

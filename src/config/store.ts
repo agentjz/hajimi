@@ -92,7 +92,6 @@ export async function resolveRuntimeConfig(overrides: CliOverrides = {}): Promis
       enabled: parseBooleanEnv(process.env.HAJIMI_REMOTE_ENABLED) ?? fileConfig.remote.enabled,
       host: process.env.HAJIMI_REMOTE_HOST ?? fileConfig.remote.host,
       port: parseNumberEnv(process.env.HAJIMI_REMOTE_PORT) ?? fileConfig.remote.port,
-      token: process.env.HAJIMI_REMOTE_TOKEN ?? fileConfig.remote.token,
       bind: process.env.HAJIMI_REMOTE_BIND ?? fileConfig.remote.bind,
       publicUrl: process.env.HAJIMI_REMOTE_PUBLIC_URL ?? fileConfig.remote.publicUrl,
     },

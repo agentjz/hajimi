@@ -1,21 +1,12 @@
 import { isInternalMessage } from "../agent/taskState.js";
-import type { RemoteSessionDetails, RemoteSessionSummary, RemoteTimelineItem } from "./types.js";
 import type { SessionRecord, StoredMessage } from "../types.js";
 import { tryParseJson } from "../utils/json.js";
-import { createRemoteTimelineItem, parseSharedFileOutput, parseTodoToolOutput, summarizeToolError } from "./timeline.js";
+import { createRemoteTimelineItem, summarizeToolError } from "./timeline.js";
+import type { RemoteSessionDetails, RemoteTimelineItem } from "./types.js";
 
 const MAX_REMOTE_MESSAGES = 40;
 const MAX_REMOTE_MESSAGE_CHARS = 12_000;
 const MAX_REMOTE_TIMELINE_ITEMS = 120;
-
-export function toRemoteSessionSummary(session: SessionRecord): RemoteSessionSummary {
-  return {
-    id: session.id,
-    title: session.title,
-    updatedAt: session.updatedAt,
-    messageCount: session.messageCount,
-  };
-}
 
 export function toRemoteSessionDetails(session: SessionRecord): RemoteSessionDetails {
   const messages = session.messages.slice(-MAX_REMOTE_MESSAGES).map(serializeMessage);
@@ -110,7 +101,7 @@ function appendMessageTimelineItems(
             toolName: toolCall.function.name,
             text: "",
             createdAt,
-            summary: "已执行",
+            summary: "已完成",
             collapsed: true,
           }),
         );
@@ -131,41 +122,6 @@ function appendMessageTimelineItems(
   }
 
   if (message.role !== "tool") {
-    return;
-  }
-
-  if (message.name === "todo_write") {
-    const todo = parseTodoToolOutput(message.content ?? "");
-    if (todo) {
-      timeline.push(
-        createRemoteTimelineItem({
-          id: `${baseId}-todo`,
-          kind: "todo",
-          text: todo.details,
-          createdAt,
-          summary: todo.summary,
-          collapsed: true,
-          todoItems: todo.items,
-        }),
-      );
-    }
-    return;
-  }
-
-  if (message.name === "remote_share_file") {
-    const sharedFile = parseSharedFileOutput(message.content ?? "");
-    if (sharedFile) {
-      timeline.push(
-        createRemoteTimelineItem({
-          id: `${baseId}-file-share`,
-          kind: "file_share",
-          text: "文件已准备好，点下载即可获取分享时刻的快照。",
-          createdAt,
-          summary: "文件已准备好",
-          file: sharedFile,
-        }),
-      );
-    }
     return;
   }
 

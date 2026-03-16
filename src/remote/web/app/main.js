@@ -1,6 +1,6 @@
-import { CONNECTION_LABELS, STATUS_LABELS, TOKEN_KEY } from "./constants.js";
+import { CONNECTION_LABELS, STATUS_LABELS } from "./constants.js";
 import { autoResizeTextarea, getElements, isNearBottom, scrollToBottom } from "./dom.js";
-import { downloadSharedFile, fetchJson, isAuthError, openEventStream } from "./network.js";
+import { fetchJson, openEventStream } from "./network.js";
 import { buildMessageElement } from "./timeline.js";
 
 export function startRemoteApp() {
@@ -10,20 +10,17 @@ export function startRemoteApp() {
 
   function createInitialState() {
     return {
-      token: localStorage.getItem(TOKEN_KEY) || "",
-      hasSnapshot: false,
+      hasConnectedOnce: false,
       shouldAutoScroll: true,
       connection: "idle",
       reconnectAttempt: 0,
       reconnectTimer: null,
       streamController: null,
       lastEventId: 0,
+      lastDisconnectReason: "",
       projectCwd: "",
       currentRun: null,
       lastSession: null,
-      recentSessions: [],
-      connectMessage: "等待连接。",
-      connectError: false,
       renderedTimelineSessionId: null,
       renderedTimelineKey: "empty",
       expandedItems: new Set(),
@@ -33,12 +30,6 @@ export function startRemoteApp() {
       activeConversationSessionId: null,
       isNewConversationDraft: true,
     };
-  }
-
-  function setConnectMessage(message, isError) {
-    state.connectMessage = message;
-    state.connectError = Boolean(isError);
-    renderAppChrome();
   }
 
   function showFooterMessage(message, isError = false, timeoutMs = 2400) {
@@ -115,32 +106,16 @@ export function startRemoteApp() {
   }
 
   function renderAppChrome() {
-    els.tokenInput.value = state.token;
-    els.connectButton.disabled = state.connection === "connecting";
-
-    const showApp = state.hasSnapshot;
     const displayedRun = getDisplayedRun();
-    els.connectScreen.classList.toggle("hidden", showApp);
-    els.appScreen.classList.toggle("hidden", !showApp);
+    const isRunning = displayedRun?.status === "running";
 
-    els.connectMessage.textContent = state.connectMessage;
-    els.connectMessage.classList.toggle("is-error", state.connectError);
-
-    if (!showApp) {
-      return;
-    }
-
-    const isRunning = Boolean(displayedRun && displayedRun.status === "running");
     els.streamPill.textContent = CONNECTION_LABELS[state.connection] || CONNECTION_LABELS.idle;
     els.runPill.textContent = resolveRunPill(displayedRun);
-    els.projectPath.textContent = state.projectCwd || "准备聊天目录中...";
-    els.projectPath.title = state.projectCwd || "";
     els.composerNote.textContent = resolveFooterText(displayedRun);
     els.composerNote.classList.toggle("is-error", resolveFooterIsError());
-    els.sendButton.disabled = isRunning;
+    els.sendButton.disabled = isRunning || state.connection !== "connected";
     els.stopButton.disabled = !isRunning;
     els.newConversationButton.disabled = isRunning;
-    els.emptyState.classList.toggle("hidden", timelineNodes.size > 0);
 
     autoResizeTextarea(els.promptInput);
   }
@@ -158,45 +133,51 @@ export function startRemoteApp() {
   }
 
   function resolveFooterIsError() {
-    return Boolean(state.footerOverride && state.footerOverrideError);
+    return Boolean(state.footerOverride && state.footerOverrideError) || state.connection === "reconnecting";
   }
 
   function resolveStatusLine(displayedRun = getDisplayedRun()) {
+    if (state.connection === "connecting") {
+      return "正在连接远程聊天页...";
+    }
+
     if (state.connection === "reconnecting") {
-      return "刚刚断开了一下，正在自动重连。";
+      return state.lastDisconnectReason
+        ? `${state.lastDisconnectReason}，正在自动重连。`
+        : "连接刚刚断开，正在自动重连。";
     }
 
     if (displayedRun) {
       if (displayedRun.status === "running") {
         return displayedRun.statusText
           ? `正在回复中：${displayedRun.statusText}`
-          : "正在接着这段对话往下回复。";
+          : "正在处理这条消息。";
       }
 
       if (displayedRun.status === "completed") {
-        return "这条消息已经回完了，可以继续聊。";
+        return "这条消息已经回复完成，可以继续发送。";
       }
 
       if (displayedRun.status === "failed") {
         return displayedRun.error
-          ? `这条消息处理得不太顺：${displayedRun.error}`
-          : "这条消息处理得不太顺。";
+          ? `这条消息处理失败：${displayedRun.error}`
+          : "这条消息处理失败。";
       }
 
       if (displayedRun.status === "cancelled") {
-        return "这条消息已经停下来了。";
+        return "这条消息已经停止。";
       }
     }
 
     if (state.isNewConversationDraft) {
-      return "这是新的对话，发出第一条消息就开始。";
+      return "这是新的空对话，发出第一条消息就开始。";
     }
 
     if (state.activeConversationSessionId) {
-      return "这段对话已经准备好了，可以继续聊。";
+      return "当前对话已就绪，可以继续发送。";
     }
 
-    return "连上以后，就能在这里开始聊天。";
+    return "连接建立后就可以开始聊天。";
   }
 
   function getDistanceFromBottom(container) {
@@ -302,7 +283,6 @@ export function startRemoteApp() {
       appendTimelineItem(item, false);
     }
 
-    els.emptyState.classList.toggle("hidden", source.items.length > 0);
     maybeScrollTimeline(scrollMode, previousDistance);
   }
 
@@ -313,14 +293,13 @@ export function startRemoteApp() {
 
     const element = buildMessageElement(item, {
       expandedItems: state.expandedItems,
-      onDownloadFile: (nextItem, button) => {
-        void handleFileDownload(nextItem, button);
+      onExpand: () => {
+        maybeScrollTimeline("if-near-bottom");
       },
     });
 
     timelineNodes.set(item.id, element);
     els.timeline.appendChild(element);
-    els.emptyState.classList.add("hidden");
 
     if (shouldScroll) {
       maybeScrollTimeline("bottom");
@@ -340,8 +319,8 @@ export function startRemoteApp() {
 
     const next = buildMessageElement(item, {
       expandedItems: state.expandedItems,
-      onDownloadFile: (nextItem, button) => {
-        void handleFileDownload(nextItem, button);
+      onExpand: () => {
+        maybeScrollTimeline("if-near-bottom");
       },
     });
 
@@ -353,44 +332,15 @@ export function startRemoteApp() {
     }
   }
 
-  async function handleFileDownload(item, button) {
-    const previousText = button.textContent;
-    button.disabled = true;
-    button.textContent = "准备下载...";
-
-    try {
-      const { blob, fileName } = await downloadSharedFile(item.file, state.token);
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = fileName;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      URL.revokeObjectURL(url);
-      showFooterMessage("文件已经开始下载。");
-    } catch (error) {
-      if (isAuthError(error)) {
-        handleAuthFailure(error.message || String(error));
-        return;
-      }
-
-      showFooterMessage(error instanceof Error ? error.message : String(error), true, 3200);
-    } finally {
-      button.disabled = false;
-      button.textContent = previousText;
-    }
-  }
-
   function applySnapshot(snapshot) {
-    const isInitialSnapshot = !state.hasSnapshot;
-    state.hasSnapshot = true;
+    const isInitialSnapshot = !state.hasConnectedOnce;
+    state.hasConnectedOnce = true;
     state.connection = "connected";
     state.reconnectAttempt = 0;
+    state.lastDisconnectReason = "";
     state.projectCwd = snapshot.projectCwd || "";
     state.currentRun = snapshot.currentRun || null;
     state.lastSession = snapshot.lastSession || null;
-    state.recentSessions = Array.isArray(snapshot.recentSessions) ? snapshot.recentSessions : [];
     state.lastEventId = typeof snapshot.streamCursor === "number" ? snapshot.streamCursor : state.lastEventId;
     state.renderedTimelineSessionId = null;
     state.renderedTimelineKey = "empty";
@@ -402,7 +352,7 @@ export function startRemoteApp() {
       state.expandedItems.clear();
     }
 
-    setConnectMessage("已连接，可以开始聊天。", false);
+    clearFooterOverride(false);
     state.shouldAutoScroll = true;
     syncTimelineFromState(true, state.currentRun?.status === "running" ? "bottom" : "preserve");
     renderAppChrome();
@@ -460,7 +410,6 @@ export function startRemoteApp() {
   }
 
   function applySessionUpdate(payload) {
-    state.recentSessions = Array.isArray(payload.recentSessions) ? payload.recentSessions : [];
     state.lastSession = payload.lastSession || null;
     syncTimelineFromState(false, "if-near-bottom");
     renderAppChrome();
@@ -499,15 +448,7 @@ export function startRemoteApp() {
   async function connectToRemote() {
     clearReconnectTimer();
 
-    if (!state.token.trim()) {
-      setConnectMessage("请先输入访问令牌。", true);
-      return;
-    }
-
-    state.token = state.token.trim();
-    localStorage.setItem(TOKEN_KEY, state.token);
-    state.connection = state.hasSnapshot ? "reconnecting" : "connecting";
-    setConnectMessage("正在建立连接...", false);
+    state.connection = state.hasConnectedOnce ? "reconnecting" : "connecting";
     renderAppChrome();
 
     if (state.streamController) {
@@ -519,17 +460,11 @@ export function startRemoteApp() {
 
     try {
       await openEventStream({
-        token: state.token,
         signal: controller.signal,
         onEvent: handleStreamEvent,
       });
     } catch (error) {
       if (controller.signal.aborted) {
-        return;
-      }
-
-      if (isAuthError(error)) {
-        handleAuthFailure(error.message || String(error));
         return;
       }
 
@@ -541,33 +476,11 @@ export function startRemoteApp() {
     }
   }
 
-  function handleAuthFailure(message) {
-    clearReconnectTimer();
-    clearFooterOverride(false);
-    state.hasSnapshot = false;
-    state.shouldAutoScroll = true;
-    state.connection = "idle";
-    state.projectCwd = "";
-    state.currentRun = null;
-    state.lastSession = null;
-    state.recentSessions = [];
-    state.renderedTimelineSessionId = null;
-    state.renderedTimelineKey = "empty";
-    state.expandedItems.clear();
-    setActiveConversation(null);
-    timelineNodes.clear();
-    els.timeline.textContent = "";
-    els.promptInput.value = "";
-    autoResizeTextarea(els.promptInput);
-    setConnectMessage(message, true);
-    renderAppChrome();
-  }
-
   function scheduleReconnect(reason) {
     clearReconnectTimer();
     state.connection = "reconnecting";
     state.reconnectAttempt += 1;
-    setConnectMessage(`${reason} 正在自动重连...`, true);
+    state.lastDisconnectReason = reason;
     renderAppChrome();
 
     const delay = Math.min(5000, 800 * Math.max(1, state.reconnectAttempt));
@@ -586,7 +499,6 @@ export function startRemoteApp() {
   async function submitPrompt(prompt) {
     const startNewConversation = state.isNewConversationDraft || !state.activeConversationSessionId;
     const run = await fetchJson("/api/runs", {
-      token: state.token,
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -599,7 +511,6 @@ export function startRemoteApp() {
 
     clearFooterOverride(false);
     state.currentRun = run;
-    state.hasSnapshot = true;
     state.shouldAutoScroll = true;
     setActiveConversation(run.sessionId);
     els.promptInput.value = "";
@@ -610,24 +521,22 @@ export function startRemoteApp() {
 
   async function cancelCurrentRun() {
     await fetchJson("/api/runs/current/cancel", {
-      token: state.token,
       method: "POST",
     });
 
     showFooterMessage("已经发出停止请求。");
   }
 
-  els.connectForm.addEventListener("submit", (event) => {
-    event.preventDefault();
-    state.token = els.tokenInput.value;
-    void connectToRemote();
-  });
-
   els.composerForm.addEventListener("submit", async (event) => {
     event.preventDefault();
     const prompt = els.promptInput.value.trim();
     if (!prompt) {
       showFooterMessage("请输入消息内容。", true, 3200);
+      return;
+    }
+
+    if (state.connection !== "connected") {
+      showFooterMessage("连接还没有准备好，请稍等一下。", true, 3200);
       return;
     }
 
@@ -639,11 +548,6 @@ export function startRemoteApp() {
     try {
       await submitPrompt(prompt);
     } catch (error) {
-      if (isAuthError(error)) {
-        handleAuthFailure(error.message || String(error));
-        return;
-      }
-
       showFooterMessage(error instanceof Error ? error.message : String(error), true, 3200);
     }
   });
@@ -653,11 +557,6 @@ export function startRemoteApp() {
       els.stopButton.disabled = true;
       await cancelCurrentRun();
     } catch (error) {
-      if (isAuthError(error)) {
-        handleAuthFailure(error.message || String(error));
-        return;
-      }
-
       showFooterMessage(error instanceof Error ? error.message : String(error), true, 3200);
     } finally {
       renderAppChrome();
@@ -690,9 +589,5 @@ export function startRemoteApp() {
 
   autoResizeTextarea(els.promptInput);
   renderAppChrome();
-
-  if (state.token) {
-    setConnectMessage("检测到已保存令牌，正在自动连接...", false);
-    void connectToRemote();
-  }
+  void connectToRemote();
 }

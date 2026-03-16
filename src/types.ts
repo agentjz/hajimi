@@ -50,7 +50,6 @@ export interface RemoteConfig {
   enabled: boolean;
   host: string;
   port: number;
-  token: string;
   bind: string;
   publicUrl: string;
 }

@@ -1,29 +1,5 @@
-export function authHeaders(token, extra = {}) {
-  return token
-    ? { Authorization: `Bearer ${token}`, ...extra }
-    : { ...extra };
-}
-
-export function createAuthError(message) {
-  const error = new Error(message);
-  error.name = "AuthError";
-  return error;
-}
-
-export function isAuthError(error) {
-  return error && error.name === "AuthError";
-}
-
 export async function fetchJson(url, options = {}) {
-  const { token, headers, ...rest } = options;
-  const response = await fetch(url, {
-    ...rest,
-    headers: authHeaders(token, headers ?? {}),
-  });
-
-  if (response.status === 401) {
-    throw createAuthError("令牌无效或已过期，请重新输入访问令牌。");
-  }
+  const response = await fetch(url, options);
 
   if (!response.ok) {
     let message = "请求失败。";
@@ -41,17 +17,13 @@ export async function fetchJson(url, options = {}) {
   return response.json();
 }
 
-export async function openEventStream({ token, signal, onEvent }) {
+export async function openEventStream({ signal, onEvent }) {
   const response = await fetch("/api/stream", {
-    headers: authHeaders(token, {
+    headers: {
       Accept: "text/event-stream",
-    }),
+    },
     signal,
   });
-
-  if (response.status === 401) {
-    throw createAuthError("令牌无效或已过期，请重新输入访问令牌。");
-  }
 
   if (!response.ok || !response.body) {
     throw new Error("SSE 连接建立失败。");
@@ -62,38 +34,6 @@ export async function openEventStream({ token, signal, onEvent }) {
   if (!signal.aborted) {
     throw new Error("SSE 连接已断开。");
   }
-}
-
-export async function downloadSharedFile(file, token) {
-  if (!file || !file.downloadPath) {
-    throw new Error("找不到可下载的文件信息。");
-  }
-
-  const response = await fetch(file.downloadPath, {
-    headers: authHeaders(token, { Accept: "*/*" }),
-  });
-
-  if (response.status === 401) {
-    throw createAuthError("令牌无效或已过期，请重新输入访问令牌。");
-  }
-
-  if (!response.ok) {
-    let message = "文件下载失败。";
-    try {
-      const payload = await response.json();
-      if (payload && typeof payload.error === "string") {
-        message = payload.error;
-      }
-    } catch {
-      message = `${response.status} ${response.statusText}`;
-    }
-    throw new Error(message);
-  }
-
-  return {
-    blob: await response.blob(),
-    fileName: file.fileName || "shared-file",
-  };
 }
 
 async function consumeEventStream(stream, signal, onEvent) {

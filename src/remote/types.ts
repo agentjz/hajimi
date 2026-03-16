@@ -1,4 +1,4 @@
-import type { SessionRecord, StoredMessage } from "../types.js";
+import type { StoredMessage } from "../types.js";
 
 export type RemoteRunStatus =
   | "idle"
@@ -7,54 +7,16 @@ export type RemoteRunStatus =
   | "failed"
   | "cancelled";
 
-export type RemoteEventKind =
-  | "status"
-  | "tool_call"
-  | "tool_result"
-  | "tool_error"
-  | "todo"
-  | "file_share"
-  | "final_answer"
-  | "warning"
-  | "error";
-
-export interface RemoteRunEvent {
-  kind: RemoteEventKind;
-  text: string;
-  createdAt: string;
-}
-
 export type RemoteTimelineItemKind =
   | "user"
   | "reasoning"
   | "tool_use"
-  | "todo"
   | "final_answer"
-  | "file_share"
   | "status"
   | "warning"
-  | "error"
-  | "assistant"
-  | "tool_call"
-  | "tool_result"
-  | "tool_error";
+  | "error";
 
 export type RemoteTimelineItemState = "streaming" | "done" | "error";
-
-export interface RemoteTimelineTodoItem {
-  id: string;
-  text: string;
-  status: "pending" | "in_progress" | "completed";
-}
-
-export interface RemoteSharedFileSummary {
-  shareId: string;
-  fileName: string;
-  relativePath: string;
-  size: number;
-  createdAt: string;
-  downloadPath: string;
-}
 
 export interface RemoteTimelineItem {
   id: string;
@@ -66,8 +28,6 @@ export interface RemoteTimelineItem {
   toolName?: string;
   summary?: string;
   collapsed?: boolean;
-  todoItems?: RemoteTimelineTodoItem[];
-  file?: RemoteSharedFileSummary;
 }
 
 export interface RemoteRunSnapshot {
@@ -79,21 +39,11 @@ export interface RemoteRunSnapshot {
   finishedAt?: string;
   error?: string;
   statusText?: string;
-  assistantPreview?: string;
-  reasoningPreview?: string;
-  events: RemoteRunEvent[];
   timeline: RemoteTimelineItem[];
 }
 
 export interface RemoteSubmitPromptOptions {
   startNewConversation?: boolean;
-}
-
-export interface RemoteSessionSummary {
-  id: string;
-  title?: string;
-  updatedAt: string;
-  messageCount: number;
 }
 
 export interface RemoteSessionDetails {
@@ -109,7 +59,6 @@ export interface RemoteStateSnapshot {
   streamCursor: number;
   projectCwd: string;
   currentRun: RemoteRunSnapshot | null;
-  recentSessions: RemoteSessionSummary[];
   lastSession: RemoteSessionDetails | null;
 }
 
@@ -118,11 +67,7 @@ export type RemoteStreamEventPayload =
   | { type: "run"; run: RemoteRunSnapshot | null }
   | { type: "timeline_add"; sessionId: string; item: RemoteTimelineItem }
   | { type: "timeline_update"; sessionId: string; item: RemoteTimelineItem }
-  | {
-      type: "session";
-      recentSessions: RemoteSessionSummary[];
-      lastSession: RemoteSessionDetails | null;
-    };
+  | { type: "session"; lastSession: RemoteSessionDetails | null };
 
 export interface RemoteStreamEvent {
   id: number;
@@ -132,23 +77,10 @@ export interface RemoteStreamEvent {
 
 export type RemoteStreamListener = (event: RemoteStreamEvent) => void;
 
-export interface RemoteSharedFileDownload {
-  fileName: string;
-  contentType: string;
-  size: number;
-  content: Buffer;
-}
-
 export interface RemoteControlProtocol {
   getState(): Promise<RemoteStateSnapshot>;
   submitPrompt(prompt: string, options?: RemoteSubmitPromptOptions): Promise<RemoteRunSnapshot>;
   cancelCurrentRun(): Promise<RemoteRunSnapshot | null>;
-  getSessionDetails(sessionId: string): Promise<RemoteSessionDetails | null>;
-  getSharedFile(shareId: string): Promise<RemoteSharedFileDownload | null>;
   subscribe(listener: RemoteStreamListener): () => void;
   stop(): Promise<void>;
-}
-
-export interface RemoteTurnRunnerResult {
-  session: SessionRecord;
 }

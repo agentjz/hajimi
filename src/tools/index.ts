@@ -1,6 +1,5 @@
 export { createToolRegistry } from "./registry.js";
 export { createRuntimeToolRegistry } from "./runtimeRegistry.js";
-export { createRemoteShareFileTool } from "./remote/remoteShareFileTool.js";
 export type {
   FunctionToolDefinition,
   RegisteredTool,

@@ -137,9 +137,28 @@ def print_summary(removed_paths: list[Path], reset_files: list[Path], dry_run: b
 
 
 def handle_remove_readonly(func, path, exc_info) -> None:
-    _ = exc_info
-    os.chmod(path, stat.S_IWRITE)
-    func(path)
+    exc = exc_info[1]
+
+    # If the path disappeared between directory walk and deletion, ignore it.
+    # This can happen on Windows if something else (AV, indexer, build step) already removed it.
+    if isinstance(exc, FileNotFoundError):
+        return
+
+    # Read-only files on Windows can raise PermissionError during rmtree; make them writable then retry.
+    if isinstance(exc, PermissionError):
+        try:
+            os.chmod(path, stat.S_IWRITE)
+        except FileNotFoundError:
+            return
+
+        try:
+            func(path)
+        except FileNotFoundError:
+            return
+        return
+
+    # Anything else should still fail loudly so we don't hide real problems.
+    raise exc
 
 
 def build_env_template() -> str:
@@ -177,7 +196,6 @@ def build_env_template() -> str:
             "HAJIMI_REMOTE_PORT=4387",
             "# Leave blank to auto-detect a LAN address at startup.",
             "# HAJIMI_REMOTE_HOST=",
-            "# HAJIMI_REMOTE_TOKEN=replace-with-a-shared-token",
             "# HAJIMI_REMOTE_PUBLIC_URL=",
             "",
         ]

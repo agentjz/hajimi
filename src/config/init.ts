@@ -55,7 +55,6 @@ export async function initializeProjectFiles(cwd: string): Promise<InitProjectRe
         "HAJIMI_REMOTE_PORT=4387",
         "# Leave blank to auto-detect a LAN address at startup.",
         "# HAJIMI_REMOTE_HOST=",
-        "# HAJIMI_REMOTE_TOKEN=replace-with-a-shared-token",
         "# HAJIMI_REMOTE_PUBLIC_URL=",
         "",
       ].join("\n"),

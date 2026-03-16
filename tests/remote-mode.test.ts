@@ -4,14 +4,10 @@ import path from "node:path";
 import test from "node:test";
 
 import { SessionStore } from "../src/agent/sessionStore.js";
-import { ChangeStore } from "../src/changes/store.js";
 import { resolveRuntimeConfig } from "../src/config/store.js";
-import { loadProjectContext } from "../src/context/projectContext.js";
-import { createRemoteTokenAuth } from "../src/remote/auth.js";
 import { startRemoteHttpServer } from "../src/remote/httpServer.js";
 import { RemoteControlService } from "../src/remote/service.js";
-import { createToolRegistry } from "../src/tools/index.js";
-import type { RuntimeConfig, StoredMessage, ToolCallRecord, ToolExecutionResult } from "../src/types.js";
+import type { RuntimeConfig, StoredMessage, ToolCallRecord } from "../src/types.js";
 import { createAbortError } from "../src/utils/abort.js";
 import { createTempWorkspace } from "./helpers.js";
 
@@ -41,7 +37,6 @@ function createRuntimeConfig(root: string, sessionsDir: string): RuntimeConfig {
       enabled: true,
       host: "",
       port: 0,
-      token: "token-1234",
       bind: "loopback",
       publicUrl: "",
     },
@@ -72,7 +67,7 @@ test("resolveRuntimeConfig reads project-scoped remote values from .hajimi/.env"
     [
       "HAJIMI_API_KEY=test-a",
       "HAJIMI_REMOTE_PORT=5101",
-      "HAJIMI_REMOTE_TOKEN=alpha-token",
+      "HAJIMI_REMOTE_HOST=10.1.1.10",
     ].join("\n"),
     "utf8",
   );
@@ -81,7 +76,7 @@ test("resolveRuntimeConfig reads project-scoped remote values from .hajimi/.env"
     [
       "HAJIMI_API_KEY=test-b",
       "HAJIMI_REMOTE_PORT=5102",
-      "HAJIMI_REMOTE_TOKEN=beta-token",
+      "HAJIMI_REMOTE_HOST=10.1.1.11",
     ].join("\n"),
     "utf8",
   );
@@ -90,9 +85,9 @@ test("resolveRuntimeConfig reads project-scoped remote values from .hajimi/.env"
   const configB = await resolveRuntimeConfig({ cwd: rootB });
 
   assert.equal(configA.remote.port, 5101);
-  assert.equal(configA.remote.token, "alpha-token");
+  assert.equal(configA.remote.host, "10.1.1.10");
   assert.equal(configB.remote.port, 5102);
-  assert.equal(configB.remote.token, "beta-token");
+  assert.equal(configB.remote.host, "10.1.1.11");
 });
 
 test("remote HTTP page serves split assets and renders phased chat state", async (t) => {
@@ -103,27 +98,28 @@ test("remote HTTP page serves split assets and renders phased chat state", async
     cwd: root,
     config: createRuntimeConfig(root, sessionsDir),
     sessionStore,
+    writeTerminalLine: () => undefined,
     runTurn: async (options) => {
+      const toolCall = createToolCall("tool-1", "read_file", { path: "README.md" });
+
       options.callbacks?.onModelWaitStart?.();
       options.callbacks?.onStatus?.("Planning the remote task");
       options.callbacks?.onReasoningDelta?.("Inspecting the repository before replying.");
       options.callbacks?.onModelWaitStop?.();
-      options.callbacks?.onAssistantDelta?.("Remote task");
-      options.callbacks?.onAssistantDelta?.(" output");
+      options.callbacks?.onToolCall?.("read_file", toolCall.function.arguments);
+      options.callbacks?.onToolResult?.("read_file", JSON.stringify({ ok: true }, null, 2));
       options.callbacks?.onAssistantDone?.("Remote task output");
 
       const messages: StoredMessage[] = [
-        {
-          role: "user",
-          content: options.input,
-          createdAt: new Date().toISOString(),
-        },
-        {
-          role: "assistant",
-          content: "Remote task output",
+        createUserMessage(options.input),
+        createAssistantMessage({
           reasoningContent: "Inspecting the repository before replying.",
-          createdAt: new Date().toISOString(),
-        },
+          toolCalls: [toolCall],
+        }),
+        createToolMessage("read_file", JSON.stringify({ ok: true }, null, 2)),
+        createAssistantMessage({
+          content: "Remote task output",
+        }),
       ];
       const session = await options.sessionStore.appendMessages(options.session, messages);
       return {
@@ -135,7 +131,6 @@ test("remote HTTP page serves split assets and renders phased chat state", async
     },
   });
   const server = await startRemoteHttpServer({
-    auth: createRemoteTokenAuth("token-1234"),
     protocol: service,
     listenHost: "127.0.0.1",
     displayHost: "127.0.0.1",
@@ -150,8 +145,9 @@ test("remote HTTP page serves split assets and renders phased chat state", async
   const html = await fetch(server.url);
   assert.equal(html.status, 200);
   const page = await html.text();
-  assert.match(page, /哈基米聊天/u);
+  assert.match(page, /哈基米远程/u);
   assert.match(page, /新建对话/u);
+  assert.doesNotMatch(page, /访问令牌/u);
   assert.match(page, /\/assets\/remote\.css/u);
   assert.match(page, /\/assets\/remote\.js/u);
 
@@ -167,16 +163,12 @@ test("remote HTTP page serves split assets and renders phased chat state", async
   assert.equal(mainModule.status, 200);
   assert.match(await mainModule.text(), /syncTimelineFromState/u);
 
-  const unauthorized = await fetch(`${server.url}/api/state`);
-  assert.equal(unauthorized.status, 401);
-
-  const unauthorizedStream = await fetch(`${server.url}/api/stream`);
-  assert.equal(unauthorizedStream.status, 401);
+  const initialState = await fetch(`${server.url}/api/state`);
+  assert.equal(initialState.status, 200);
 
   const started = await fetch(`${server.url}/api/runs`, {
     method: "POST",
     headers: {
-      Authorization: "Bearer token-1234",
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ prompt: "inspect the project" }),
@@ -185,17 +177,85 @@ test("remote HTTP page serves split assets and renders phased chat state", async
 
   const state = await waitForRemoteState(
     server.url,
-    "token-1234",
     (snapshot) => snapshot.currentRun?.status === "completed",
   );
 
   assert.equal(state.currentRun.status, "completed");
-  assert.match(String(state.currentRun.assistantPreview ?? ""), /Remote task output/);
-  assert.equal(state.recentSessions.length, 1);
-  assert.equal(state.lastSession?.messages.at(-1)?.content, "Remote task output");
-  assert.equal(state.lastSession?.timeline.at(-1)?.kind, "final_answer");
-  assert.equal(state.currentRun.timeline[0]?.kind, "user");
+  assert.equal(state.currentRun.timeline.filter((item) => item.kind === "user").length, 1);
+  assert.equal(state.currentRun.timeline.filter((item) => item.kind === "tool_use").length, 1);
+  assert.equal(state.currentRun.timeline.filter((item) => item.kind === "final_answer").length, 1);
   assert.equal(state.currentRun.timeline.at(-1)?.kind, "status");
+  assert.equal(state.lastSession?.timeline.filter((item) => item.kind === "final_answer").length, 1);
+});
+
+test("remote mirrors tool calls and final answers to terminal output", async (t) => {
+  const root = await createTempWorkspace("remote-terminal-output", t);
+  const sessionsDir = path.join(root, "sessions");
+  const sessionStore = new SessionStore(sessionsDir);
+  const terminalLines: string[] = [];
+  const service = new RemoteControlService({
+    cwd: root,
+    config: createRuntimeConfig(root, sessionsDir),
+    sessionStore,
+    writeTerminalLine: (line) => {
+      terminalLines.push(line);
+    },
+    runTurn: async (options) => {
+      const toolCall = createToolCall("tool-1", "read_file", { path: "README.md" });
+
+      options.callbacks?.onToolCall?.("read_file", toolCall.function.arguments);
+      options.callbacks?.onToolResult?.("read_file", JSON.stringify({ ok: true }, null, 2));
+      options.callbacks?.onAssistantDone?.("Remote task output");
+
+      const messages: StoredMessage[] = [
+        createUserMessage(options.input),
+        createAssistantMessage({
+          toolCalls: [toolCall],
+        }),
+        createToolMessage("read_file", JSON.stringify({ ok: true }, null, 2)),
+        createAssistantMessage({
+          content: "Remote task output",
+        }),
+      ];
+      const session = await options.sessionStore.appendMessages(options.session, messages);
+      return {
+        session,
+        changedPaths: [],
+        verificationAttempted: false,
+        yielded: false,
+      };
+    },
+  });
+  const server = await startRemoteHttpServer({
+    protocol: service,
+    listenHost: "127.0.0.1",
+    displayHost: "127.0.0.1",
+    port: 0,
+  });
+
+  t.after(async () => {
+    await service.stop();
+    await server.stop();
+  });
+
+  const started = await fetch(`${server.url}/api/runs`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ prompt: "inspect the project" }),
+  });
+  assert.equal(started.status, 202);
+
+  await waitForRemoteState(
+    server.url,
+    (snapshot) => snapshot.currentRun?.status === "completed",
+  );
+
+  assert.deepEqual(terminalLines, [
+    "[remote] Tool: read_file",
+    "[remote] Final: Remote task output",
+  ]);
 });
 
 test("remote keeps the same session and timeline when the next message continues the chat", async (t) => {
@@ -206,6 +266,7 @@ test("remote keeps the same session and timeline when the next message continues
     cwd: root,
     config: createRuntimeConfig(root, sessionsDir),
     sessionStore,
+    writeTerminalLine: () => undefined,
     runTurn: async (options) => {
       const previousUserMessages = options.session.messages
         .filter((message) => message.role === "user" && message.content)
@@ -218,16 +279,10 @@ test("remote keeps the same session and timeline when the next message continues
       options.callbacks?.onAssistantDone?.(answer);
 
       const messages: StoredMessage[] = [
-        {
-          role: "user",
-          content: options.input,
-          createdAt: new Date().toISOString(),
-        },
-        {
-          role: "assistant",
+        createUserMessage(options.input),
+        createAssistantMessage({
           content: answer,
-          createdAt: new Date().toISOString(),
-        },
+        }),
       ];
       const session = await options.sessionStore.appendMessages(options.session, messages);
       return {
@@ -239,7 +294,6 @@ test("remote keeps the same session and timeline when the next message continues
     },
   });
   const server = await startRemoteHttpServer({
-    auth: createRemoteTokenAuth("token-1234"),
     protocol: service,
     listenHost: "127.0.0.1",
     displayHost: "127.0.0.1",
@@ -254,7 +308,6 @@ test("remote keeps the same session and timeline when the next message continues
   const firstResponse = await fetch(`${server.url}/api/runs`, {
     method: "POST",
     headers: {
-      Authorization: "Bearer token-1234",
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ prompt: "第一句" }),
@@ -264,14 +317,12 @@ test("remote keeps the same session and timeline when the next message continues
 
   await waitForRemoteState(
     server.url,
-    "token-1234",
-    (snapshot) => snapshot.currentRun?.status === "completed" && snapshot.recentSessions.length === 1,
+    (snapshot) => snapshot.currentRun?.status === "completed" && snapshot.lastSession?.messages.length === 2,
   );
 
   const secondResponse = await fetch(`${server.url}/api/runs`, {
     method: "POST",
     headers: {
-      Authorization: "Bearer token-1234",
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ prompt: "第二句" }),
@@ -280,28 +331,10 @@ test("remote keeps the same session and timeline when the next message continues
   const secondRun = await secondResponse.json() as { sessionId: string };
   assert.equal(secondRun.sessionId, firstRun.sessionId);
 
-  await waitForRemoteState(
+  const state = await waitForRemoteState(
     server.url,
-    "token-1234",
     (snapshot) => snapshot.currentRun?.status === "completed" && snapshot.lastSession?.messages.length === 4,
   );
-
-  const stateResponse = await fetch(`${server.url}/api/state`, {
-    headers: {
-      Authorization: "Bearer token-1234",
-    },
-  });
-  assert.equal(stateResponse.status, 200);
-  const state = await stateResponse.json() as {
-    currentRun: {
-      sessionId: string;
-      timeline: Array<{ kind: string; text: string }>;
-    } | null;
-    lastSession: {
-      id: string;
-      messages: Array<{ content: string | null }>;
-    } | null;
-  };
 
   assert.equal(state.currentRun?.sessionId, firstRun.sessionId);
   assert.equal(state.lastSession?.id, firstRun.sessionId);
@@ -323,6 +356,7 @@ test("remote can start a fresh conversation when the next message requests a new
     cwd: root,
     config: createRuntimeConfig(root, sessionsDir),
     sessionStore,
+    writeTerminalLine: () => undefined,
     runTurn: async (options) => {
       const previousUserMessages = options.session.messages
         .filter((message) => message.role === "user" && message.content)
@@ -335,16 +369,10 @@ test("remote can start a fresh conversation when the next message requests a new
       options.callbacks?.onAssistantDone?.(answer);
 
       const messages: StoredMessage[] = [
-        {
-          role: "user",
-          content: options.input,
-          createdAt: new Date().toISOString(),
-        },
-        {
-          role: "assistant",
+        createUserMessage(options.input),
+        createAssistantMessage({
           content: answer,
-          createdAt: new Date().toISOString(),
-        },
+        }),
       ];
       const session = await options.sessionStore.appendMessages(options.session, messages);
       return {
@@ -356,7 +384,6 @@ test("remote can start a fresh conversation when the next message requests a new
     },
   });
   const server = await startRemoteHttpServer({
-    auth: createRemoteTokenAuth("token-1234"),
     protocol: service,
     listenHost: "127.0.0.1",
     displayHost: "127.0.0.1",
@@ -371,7 +398,6 @@ test("remote can start a fresh conversation when the next message requests a new
   const firstResponse = await fetch(`${server.url}/api/runs`, {
     method: "POST",
     headers: {
-      Authorization: "Bearer token-1234",
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ prompt: "第一句" }),
@@ -381,14 +407,12 @@ test("remote can start a fresh conversation when the next message requests a new
 
   await waitForRemoteState(
     server.url,
-    "token-1234",
-    (snapshot) => snapshot.currentRun?.status === "completed" && snapshot.recentSessions.length === 1,
+    (snapshot) => snapshot.currentRun?.status === "completed" && snapshot.lastSession?.messages.length === 2,
   );
 
   const secondResponse = await fetch(`${server.url}/api/runs`, {
     method: "POST",
     headers: {
-      Authorization: "Bearer token-1234",
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ prompt: "重新开始", startNewConversation: true }),
@@ -397,44 +421,19 @@ test("remote can start a fresh conversation when the next message requests a new
   const secondRun = await secondResponse.json() as { sessionId: string };
   assert.notEqual(secondRun.sessionId, firstRun.sessionId);
 
-  await waitForRemoteState(
+  const state = await waitForRemoteState(
     server.url,
-    "token-1234",
     (snapshot) =>
       snapshot.currentRun?.status === "completed" &&
       snapshot.currentRun.timeline.some((item) => item.kind === "final_answer") &&
-      snapshot.recentSessions.length === 2 &&
       snapshot.lastSession?.messages.length === 2,
   );
 
-  const stateResponse = await fetch(`${server.url}/api/state`, {
-    headers: {
-      Authorization: "Bearer token-1234",
-    },
-  });
-  assert.equal(stateResponse.status, 200);
-  const state = await stateResponse.json() as {
-    currentRun: {
-      sessionId: string;
-      timeline: Array<{ kind: string; text: string }>;
-    } | null;
-    recentSessions: Array<{ id: string }>;
-    lastSession: {
-      id: string;
-      messages: Array<{ content: string | null }>;
-    } | null;
-  };
-
   assert.equal(state.currentRun?.sessionId, secondRun.sessionId);
   assert.equal(state.lastSession?.id, secondRun.sessionId);
-  assert.equal(state.recentSessions.length, 2);
   assert.deepEqual(
     state.lastSession?.messages.map((message) => message.content),
     ["重新开始", "starting fresh -> 重新开始"],
-  );
-  assert.match(
-    String(state.currentRun?.timeline.filter((item) => item.kind === "final_answer").at(-1)?.text ?? ""),
-    /starting fresh -> 重新开始/u,
   );
 });
 
@@ -446,45 +445,18 @@ test("remote SSE stream delivers phased timeline events without final-answer str
     cwd: root,
     config: createRuntimeConfig(root, sessionsDir),
     sessionStore,
+    writeTerminalLine: () => undefined,
     runTurn: async (options) => {
-      const toolCall: ToolCallRecord = {
-        id: "tool-1",
-        type: "function",
-        function: {
-          name: "todo_write",
-          arguments: JSON.stringify({
-            items: [
-              { id: "1", text: "Inspect remote flow", status: "completed" },
-              { id: "2", text: "Render phased cards", status: "in_progress" },
-            ],
-          }),
-        },
-      };
+      const toolCall = createToolCall("tool-1", "read_file", { path: "README.md" });
 
       options.callbacks?.onModelWaitStart?.();
-      options.callbacks?.onStatus?.("Reviewing the todo plan");
+      options.callbacks?.onStatus?.("Reviewing the current plan");
       options.callbacks?.onReasoningDelta?.("Inspect current remote workflow.");
       await delay(15);
       options.callbacks?.onModelWaitStop?.();
-      options.callbacks?.onToolCall?.("todo_write", toolCall.function.arguments);
+      options.callbacks?.onToolCall?.("read_file", toolCall.function.arguments);
       await delay(15);
-      options.callbacks?.onToolResult?.(
-        "todo_write",
-        JSON.stringify(
-          {
-            ok: true,
-            items: [
-              { id: "1", text: "Inspect remote flow", status: "completed" },
-              { id: "2", text: "Render phased cards", status: "in_progress" },
-            ],
-            total: 2,
-            completed: 1,
-            inProgress: "2",
-          },
-          null,
-          2,
-        ),
-      );
+      options.callbacks?.onToolResult?.("read_file", JSON.stringify({ ok: true }, null, 2));
       await delay(15);
       options.callbacks?.onAssistantDelta?.("Phased");
       await delay(15);
@@ -492,39 +464,15 @@ test("remote SSE stream delivers phased timeline events without final-answer str
       options.callbacks?.onAssistantDone?.("Phased answer");
 
       const messages: StoredMessage[] = [
-        {
-          role: "user",
-          content: options.input,
-          createdAt: new Date().toISOString(),
-        },
-        {
-          role: "assistant",
-          content: "",
+        createUserMessage(options.input),
+        createAssistantMessage({
           reasoningContent: "Inspect current remote workflow.",
-          tool_calls: [toolCall],
-          createdAt: new Date().toISOString(),
-        },
-        {
-          role: "tool",
-          name: "todo_write",
-          content: JSON.stringify(
-            {
-              ok: true,
-              items: [
-                { id: "1", text: "Inspect remote flow", status: "completed" },
-                { id: "2", text: "Render phased cards", status: "in_progress" },
-              ],
-            },
-            null,
-            2,
-          ),
-          createdAt: new Date().toISOString(),
-        },
-        {
-          role: "assistant",
+          toolCalls: [toolCall],
+        }),
+        createToolMessage("read_file", JSON.stringify({ ok: true }, null, 2)),
+        createAssistantMessage({
           content: "Phased answer",
-          createdAt: new Date().toISOString(),
-        },
+        }),
       ];
       const session = await options.sessionStore.appendMessages(options.session, messages);
       return {
@@ -536,7 +484,6 @@ test("remote SSE stream delivers phased timeline events without final-answer str
     },
   });
   const server = await startRemoteHttpServer({
-    auth: createRemoteTokenAuth("token-1234"),
     protocol: service,
     listenHost: "127.0.0.1",
     displayHost: "127.0.0.1",
@@ -550,7 +497,6 @@ test("remote SSE stream delivers phased timeline events without final-answer str
 
   const streamResponse = await fetch(`${server.url}/api/stream`, {
     headers: {
-      Authorization: "Bearer token-1234",
       Accept: "text/event-stream",
     },
   });
@@ -565,7 +511,6 @@ test("remote SSE stream delivers phased timeline events without final-answer str
       events.some((event) => event.event === "timeline_add" && event.data.item?.kind === "reasoning") &&
       events.some((event) => event.event === "timeline_add" && event.data.item?.kind === "tool_use") &&
       events.some((event) => event.event === "timeline_update" && event.data.item?.kind === "tool_use") &&
-      events.some((event) => event.event === "timeline_add" && event.data.item?.kind === "todo") &&
       events.some((event) => event.event === "timeline_add" && event.data.item?.kind === "final_answer") &&
       events.some((event) => event.event === "run" && event.data.run?.status === "completed"),
   );
@@ -573,7 +518,6 @@ test("remote SSE stream delivers phased timeline events without final-answer str
   const started = await fetch(`${server.url}/api/runs`, {
     method: "POST",
     headers: {
-      Authorization: "Bearer token-1234",
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ prompt: "stream the current progress" }),
@@ -598,252 +542,6 @@ test("remote SSE stream delivers phased timeline events without final-answer str
   assert.ok(events.some((event) => event.event === "session"));
 });
 
-test("remote file sharing creates a downloadable snapshot by share id", async (t) => {
-  const root = await createTempWorkspace("remote-share", t);
-  await fs.writeFile(path.join(root, "shared.txt"), "first version", "utf8");
-
-  const sessionsDir = path.join(root, "sessions");
-  const config = createRuntimeConfig(root, sessionsDir);
-  const sessionStore = new SessionStore(sessionsDir);
-  const service = new RemoteControlService({
-    cwd: root,
-    config,
-    sessionStore,
-    runTurn: async (options) => {
-      const toolCall: ToolCallRecord = {
-        id: "tool-share-1",
-        type: "function",
-        function: {
-          name: "remote_share_file",
-          arguments: JSON.stringify({ path: "shared.txt" }),
-        },
-      };
-
-      options.callbacks?.onToolCall?.("remote_share_file", toolCall.function.arguments);
-      const toolOutput = await executeToolForTest(options, toolCall.function.name, toolCall.function.arguments);
-      options.callbacks?.onToolResult?.("remote_share_file", toolOutput);
-
-      await fs.writeFile(path.join(root, "shared.txt"), "second version", "utf8");
-      options.callbacks?.onAssistantDone?.("I shared the file.");
-
-      const messages: StoredMessage[] = [
-        {
-          role: "user",
-          content: options.input,
-          createdAt: new Date().toISOString(),
-        },
-        {
-          role: "assistant",
-          content: "",
-          tool_calls: [toolCall],
-          createdAt: new Date().toISOString(),
-        },
-        {
-          role: "tool",
-          name: "remote_share_file",
-          content: toolOutput,
-          createdAt: new Date().toISOString(),
-        },
-        {
-          role: "assistant",
-          content: "I shared the file.",
-          createdAt: new Date().toISOString(),
-        },
-      ];
-      const session = await options.sessionStore.appendMessages(options.session, messages);
-      return {
-        session,
-        changedPaths: [],
-        verificationAttempted: false,
-        yielded: false,
-      };
-    },
-  });
-  const server = await startRemoteHttpServer({
-    auth: createRemoteTokenAuth("token-1234"),
-    protocol: service,
-    listenHost: "127.0.0.1",
-    displayHost: "127.0.0.1",
-    port: 0,
-  });
-
-  t.after(async () => {
-    await service.stop();
-    await server.stop();
-  });
-
-  const started = await fetch(`${server.url}/api/runs`, {
-    method: "POST",
-    headers: {
-      Authorization: "Bearer token-1234",
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ prompt: "share the file with me" }),
-  });
-  assert.equal(started.status, 202);
-
-  const state = await waitForRemoteState(
-    server.url,
-    "token-1234",
-    (snapshot) =>
-      snapshot.currentRun?.status === "completed" &&
-      snapshot.currentRun.timeline.some((item) => item.kind === "file_share"),
-  );
-
-  const sharedItem = state.currentRun.timeline.find((item) => item.kind === "file_share");
-  assert.ok(sharedItem?.file?.shareId);
-  assert.equal(sharedItem?.file?.fileName, "shared.txt");
-  assert.equal(state.lastSession?.timeline.some((item) => item.kind === "file_share"), true);
-
-  const download = await fetch(`${server.url}/api/files/${sharedItem.file.shareId}`, {
-    headers: {
-      Authorization: "Bearer token-1234",
-    },
-  });
-  assert.equal(download.status, 200);
-  assert.match(String(download.headers.get("content-disposition")), /shared\.txt/);
-  assert.equal(await download.text(), "first version");
-});
-
-test("remote auto-shares the final generated document as a downloadable file card", async (t) => {
-  const root = await createTempWorkspace("remote-auto-share", t);
-  const sessionsDir = path.join(root, "sessions");
-  const config = createRuntimeConfig(root, sessionsDir);
-  const sessionStore = new SessionStore(sessionsDir);
-  const service = new RemoteControlService({
-    cwd: root,
-    config,
-    sessionStore,
-    runTurn: async (options) => {
-      const writeCall: ToolCallRecord = {
-        id: "tool-write-1",
-        type: "function",
-        function: {
-          name: "write_file",
-          arguments: JSON.stringify({
-            path: "docs/report.md",
-            content: "# Report\n\ndraft version",
-          }),
-        },
-      };
-      const editCall: ToolCallRecord = {
-        id: "tool-edit-1",
-        type: "function",
-        function: {
-          name: "edit_file",
-          arguments: JSON.stringify({
-            path: "docs/report.md",
-            old_string: "draft version",
-            new_string: "final version",
-          }),
-        },
-      };
-
-      options.callbacks?.onToolCall?.("write_file", writeCall.function.arguments);
-      const writeResult = await executeToolForTestDetailed(options, writeCall.function.name, writeCall.function.arguments);
-      options.callbacks?.onToolResult?.("write_file", writeResult.output);
-
-      options.callbacks?.onToolCall?.("edit_file", editCall.function.arguments);
-      const editResult = await executeToolForTestDetailed(options, editCall.function.name, editCall.function.arguments);
-      options.callbacks?.onToolResult?.("edit_file", editResult.output);
-
-      options.callbacks?.onAssistantDone?.("The document is ready.");
-
-      const messages: StoredMessage[] = [
-        {
-          role: "user",
-          content: options.input,
-          createdAt: new Date().toISOString(),
-        },
-        {
-          role: "assistant",
-          content: "",
-          tool_calls: [writeCall],
-          createdAt: new Date().toISOString(),
-        },
-        {
-          role: "tool",
-          name: "write_file",
-          content: writeResult.output,
-          createdAt: new Date().toISOString(),
-        },
-        {
-          role: "assistant",
-          content: "",
-          tool_calls: [editCall],
-          createdAt: new Date().toISOString(),
-        },
-        {
-          role: "tool",
-          name: "edit_file",
-          content: editResult.output,
-          createdAt: new Date().toISOString(),
-        },
-        {
-          role: "assistant",
-          content: "The document is ready.",
-          createdAt: new Date().toISOString(),
-        },
-      ];
-      const session = await options.sessionStore.appendMessages(options.session, messages);
-      return {
-        session,
-        changedPaths: [
-          ...(writeResult.metadata?.changedPaths ?? []),
-          ...(editResult.metadata?.changedPaths ?? []),
-        ],
-        verificationAttempted: false,
-        yielded: false,
-      };
-    },
-  });
-  const server = await startRemoteHttpServer({
-    auth: createRemoteTokenAuth("token-1234"),
-    protocol: service,
-    listenHost: "127.0.0.1",
-    displayHost: "127.0.0.1",
-    port: 0,
-  });
-
-  t.after(async () => {
-    await service.stop();
-    await server.stop();
-  });
-
-  const started = await fetch(`${server.url}/api/runs`, {
-    method: "POST",
-    headers: {
-      Authorization: "Bearer token-1234",
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ prompt: "create a report and send it to my phone" }),
-  });
-  assert.equal(started.status, 202);
-
-  const state = await waitForRemoteState(
-    server.url,
-    "token-1234",
-    (snapshot) =>
-      snapshot.currentRun?.status === "completed" &&
-      snapshot.currentRun.timeline.filter((item) => item.kind === "file_share").length === 1 &&
-      snapshot.lastSession?.timeline.some((item) => item.kind === "file_share") === true,
-  );
-
-  const sharedItem = state.currentRun.timeline.find((item) => item.kind === "file_share");
-  assert.equal(sharedItem?.file?.fileName, "report.md");
-  assert.equal(sharedItem?.file?.relativePath, "docs/report.md");
-  assert.equal(state.lastSession?.timeline.filter((item) => item.kind === "file_share").length, 1);
-
-  const download = await fetch(`${server.url}/api/files/${sharedItem?.file?.shareId}`, {
-    headers: {
-      Authorization: "Bearer token-1234",
-    },
-  });
-  assert.equal(download.status, 200);
-  assert.match(String(download.headers.get("content-disposition")), /report\.md/);
-  assert.equal(await download.text(), "# Report\n\nfinal version");
-});
-
 test("remote control can cancel the current run", async (t) => {
   const root = await createTempWorkspace("remote-cancel", t);
   const sessionsDir = path.join(root, "sessions");
@@ -852,14 +550,11 @@ test("remote control can cancel the current run", async (t) => {
     cwd: root,
     config: createRuntimeConfig(root, sessionsDir),
     sessionStore,
+    writeTerminalLine: () => undefined,
     runTurn: async (options) => {
       options.callbacks?.onStatus?.("Working");
       await options.sessionStore.appendMessages(options.session, [
-        {
-          role: "user",
-          content: options.input,
-          createdAt: new Date().toISOString(),
-        },
+        createUserMessage(options.input),
       ]);
 
       await new Promise<void>((resolve, reject) => {
@@ -888,7 +583,6 @@ test("remote control can cancel the current run", async (t) => {
     },
   });
   const server = await startRemoteHttpServer({
-    auth: createRemoteTokenAuth("token-1234"),
     protocol: service,
     listenHost: "127.0.0.1",
     displayHost: "127.0.0.1",
@@ -903,7 +597,6 @@ test("remote control can cancel the current run", async (t) => {
   await fetch(`${server.url}/api/runs`, {
     method: "POST",
     headers: {
-      Authorization: "Bearer token-1234",
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ prompt: "long task" }),
@@ -911,15 +604,11 @@ test("remote control can cancel the current run", async (t) => {
 
   const cancelled = await fetch(`${server.url}/api/runs/current/cancel`, {
     method: "POST",
-    headers: {
-      Authorization: "Bearer token-1234",
-    },
   });
   assert.equal(cancelled.status, 200);
 
   const state = await waitForRemoteState(
     server.url,
-    "token-1234",
     (snapshot) => snapshot.currentRun?.status === "cancelled",
   );
 
@@ -928,131 +617,97 @@ test("remote control can cancel the current run", async (t) => {
   assert.equal(state.currentRun.timeline.at(-1)?.kind, "warning");
 });
 
-async function executeToolForTest(
-  options: {
-    toolRegistry?: {
-      execute: (
-        name: string,
-        rawArgs: string,
-        context: {
-          config: RuntimeConfig;
-          cwd: string;
-          sessionId: string;
-          identity: { kind: "lead"; name: "lead" };
-          projectContext: Awaited<ReturnType<typeof loadProjectContext>>;
-          changeStore: ChangeStore;
-          createToolRegistry: typeof createToolRegistry;
-        },
-      ) => Promise<ToolExecutionResult>;
-    };
-    config: RuntimeConfig;
-    cwd: string;
-    session: { id: string };
-  },
-  name: string,
-  rawArgs: string,
-): Promise<string> {
-  const result = await executeToolForTestDetailed(options, name, rawArgs);
-  return result.output;
+function createToolCall(id: string, name: string, args: Record<string, unknown>): ToolCallRecord {
+  return {
+    id,
+    type: "function",
+    function: {
+      name,
+      arguments: JSON.stringify(args),
+    },
+  };
 }
 
-async function executeToolForTestDetailed(
-  options: {
-    toolRegistry?: {
-      execute: (
-        name: string,
-        rawArgs: string,
-        context: {
-          config: RuntimeConfig;
-          cwd: string;
-          sessionId: string;
-          identity: { kind: "lead"; name: "lead" };
-          projectContext: Awaited<ReturnType<typeof loadProjectContext>>;
-          changeStore: ChangeStore;
-          createToolRegistry: typeof createToolRegistry;
-        },
-      ) => Promise<ToolExecutionResult>;
-    };
-    config: RuntimeConfig;
-    cwd: string;
-    session: { id: string };
-  },
-  name: string,
-  rawArgs: string,
-): Promise<ToolExecutionResult> {
-  assert.ok(options.toolRegistry, "Expected a tool registry from remote service.");
+function createUserMessage(content: string): StoredMessage {
+  return {
+    role: "user",
+    content,
+    createdAt: new Date().toISOString(),
+  };
+}
 
-  const projectContext = await loadProjectContext(options.cwd);
-  const changeStore = new ChangeStore(options.config.paths.changesDir);
-  return options.toolRegistry.execute(name, rawArgs, {
-    config: options.config,
-    cwd: options.cwd,
-    sessionId: options.session.id,
-    identity: {
-      kind: "lead",
-      name: "lead",
-    },
-    projectContext,
-    changeStore,
-    createToolRegistry,
-  });
+function createAssistantMessage(options: {
+  content?: string;
+  reasoningContent?: string;
+  toolCalls?: ToolCallRecord[];
+}): StoredMessage {
+  return {
+    role: "assistant",
+    content: options.content ?? "",
+    reasoningContent: options.reasoningContent,
+    tool_calls: options.toolCalls,
+    createdAt: new Date().toISOString(),
+  };
+}
+
+function createToolMessage(name: string, content: string): StoredMessage {
+  return {
+    role: "tool",
+    name,
+    content,
+    createdAt: new Date().toISOString(),
+  };
 }
 
 async function waitForRemoteState(
   baseUrl: string,
-  token: string,
   predicate: (state: {
     currentRun: {
+      sessionId: string;
       status: string;
       error?: string;
-      assistantPreview?: string;
-      timeline: Array<{ kind: string; file?: { shareId?: string; fileName?: string; relativePath?: string } }>;
+      timeline: Array<{ kind: string; text: string }>;
     } | null;
-    recentSessions: Array<{ id: string }>;
     lastSession: {
+      id: string;
       messages: Array<{ content: string | null }>;
-      timeline: Array<{ kind: string; file?: { shareId?: string; fileName?: string; relativePath?: string } }>;
+      timeline: Array<{ kind: string; text: string }>;
     } | null;
   }) => boolean,
 ): Promise<{
   currentRun: {
+    sessionId: string;
     status: string;
     error?: string;
-    assistantPreview?: string;
-    timeline: Array<{ kind: string; file?: { shareId?: string; fileName?: string; relativePath?: string } }>;
+    timeline: Array<{ kind: string; text: string }>;
   };
-  recentSessions: Array<{ id: string }>;
   lastSession: {
+    id: string;
     messages: Array<{ content: string | null }>;
-    timeline: Array<{ kind: string; file?: { shareId?: string; fileName?: string; relativePath?: string } }>;
+    timeline: Array<{ kind: string; text: string }>;
   } | null;
 }> {
   const deadline = Date.now() + 5_000;
 
   while (Date.now() < deadline) {
-    const response = await fetch(`${baseUrl}/api/state`, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
-    });
+    const response = await fetch(`${baseUrl}/api/state`);
     const state = (await response.json()) as {
       currentRun: {
+        sessionId: string;
         status: string;
         error?: string;
-        assistantPreview?: string;
-        timeline: Array<{ kind: string; file?: { shareId?: string; fileName?: string; relativePath?: string } }>;
+        timeline: Array<{ kind: string; text: string }>;
       } | null;
-      recentSessions: Array<{ id: string }>;
       lastSession: {
+        id: string;
         messages: Array<{ content: string | null }>;
-        timeline: Array<{ kind: string; file?: { shareId?: string; fileName?: string; relativePath?: string } }>;
+        timeline: Array<{ kind: string; text: string }>;
       } | null;
     };
 
     if (predicate(state)) {
       return {
         currentRun: state.currentRun!,
-        recentSessions: state.recentSessions,
         lastSession: state.lastSession,
       };
     }

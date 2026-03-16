@@ -1,7 +1,6 @@
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 
-import type { RemoteAuth } from "./auth.js";
 import {
   renderRemoteControlAsset,
   renderRemoteControlPage,
@@ -11,7 +10,6 @@ import {
 import type { RemoteControlProtocol, RemoteStreamEvent } from "./types.js";
 
 export interface RemoteHttpServerOptions {
-  auth: RemoteAuth;
   protocol: RemoteControlProtocol;
   listenHost: string;
   displayHost: string;
@@ -96,11 +94,6 @@ async function handleRequest(
       return;
     }
 
-    if (requestUrl.pathname.startsWith("/api/") && !options.auth.authorize(request)) {
-      sendJson(response, 401, { ok: false, error: "Unauthorized. Provide a valid remote access token." });
-      return;
-    }
-
     if (method === "GET" && requestUrl.pathname === "/api/state") {
       sendJson(response, 200, await options.protocol.getState());
       return;
@@ -127,30 +120,6 @@ async function handleRequest(
         ok: true,
         run,
       });
-      return;
-    }
-
-    const fileMatch = requestUrl.pathname.match(/^\/api\/files\/([^/]+)$/);
-    if (method === "GET" && fileMatch?.[1]) {
-      const file = await options.protocol.getSharedFile(decodeURIComponent(fileMatch[1]));
-      if (!file) {
-        sendJson(response, 404, { ok: false, error: "Shared file not found." });
-        return;
-      }
-
-      sendDownload(response, file.fileName, file.contentType, file.content);
-      return;
-    }
-
-    const sessionMatch = requestUrl.pathname.match(/^\/api\/sessions\/([^/]+)$/);
-    if (method === "GET" && sessionMatch?.[1]) {
-      const session = await options.protocol.getSessionDetails(decodeURIComponent(sessionMatch[1]));
-      if (!session) {
-        sendJson(response, 404, { ok: false, error: "Session not found." });
-        return;
-      }
-
-      sendJson(response, 200, session);
       return;
     }
 
@@ -303,25 +272,6 @@ function sendJson(response: http.ServerResponse, statusCode: number, payload: un
     "Cache-Control": "no-store",
   });
   response.end(JSON.stringify(payload));
-}
-
-function sendDownload(
-  response: http.ServerResponse,
-  fileName: string,
-  contentType: string,
-  content: Buffer,
-): void {
-  response.writeHead(200, {
-    "Content-Type": contentType,
-    "Content-Length": content.length,
-    "Cache-Control": "no-store",
-    "Content-Disposition": `attachment; filename="${encodeDownloadFileName(fileName)}"`,
-  });
-  response.end(content);
-}
-
-function encodeDownloadFileName(fileName: string): string {
-  return fileName.replace(/["\r\n]/g, "_");
 }
 
 function isSafeAssetName(name: string): boolean {

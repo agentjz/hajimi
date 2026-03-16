@@ -153,7 +153,7 @@ hajimi config show
 | `hajimi resume [sessionId]` | 继续最近一次或指定会话 |
 | `hajimi sessions [-n 20]` | 查看最近会话 |
 | `hajimi init` | 在当前项目生成 `.env` 和 `.hajimiignore` |
-| `hajimi remote` | 启动局域网远程控制页（手机聊天界面 + token 验证 + SSE 流式输出） |
+| `hajimi remote` | 启动局域网远程聊天页（直连访问 + SSE 阶段式时间线） |
 | `hajimi changes [changeId] [-n 20]` | 查看变更记录或单条变更 |
 | `hajimi undo [changeId]` | 回滚最近一次或指定变更 |
 | `hajimi diff [path]` | 查看当前项目的 Git diff |
@@ -217,14 +217,14 @@ hajimi remote
 这会启动一个同 WiFi 可访问的手机聊天式控制页，并在终端打印：
 
 - 局域网 URL
-- access token
 
 手机端页面现在是：
 
-- 轻量令牌连接页
+- 直接打开就能进入，不需要 token
 - 中文聊天式主界面“哈基米远程”
+- 初始空对话 + 顶部 `新建对话`
 - 底部输入框 + `发送` / `停止`
-- SSE 推送的实时消息流：用户输入、思考过程、工具调用、工具输出、最终回答
+- SSE 推送的阶段式时间线：用户输入、思考过程、工具使用、最终回答
 
 远程模式的详细说明见：
 

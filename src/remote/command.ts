@@ -2,8 +2,7 @@ import { SessionStore } from "../agent/sessionStore.js";
 import { ui } from "../utils/console.js";
 import { writeStdoutLine } from "../utils/stdio.js";
 import type { RuntimeConfig } from "../types.js";
-import { createRemoteTokenAuth } from "./auth.js";
-import { createRemoteAccessToken, resolveRemoteListenHost } from "./config.js";
+import { resolveRemoteListenHost } from "./config.js";
 import { startRemoteHttpServer } from "./httpServer.js";
 import { resolveRemoteDisplayHost } from "./network.js";
 import { RemoteControlService } from "./service.js";
@@ -24,7 +23,6 @@ export async function runRemoteMode(options: RunRemoteModeOptions): Promise<void
     requestedHost,
     listenHost: binding.listenHost,
   });
-  const accessToken = options.config.remote.token.trim() || createRemoteAccessToken();
   const sessionStore = new SessionStore(options.config.paths.sessionsDir);
   const protocol = new RemoteControlService({
     cwd: options.cwd,
@@ -32,7 +30,6 @@ export async function runRemoteMode(options: RunRemoteModeOptions): Promise<void
     sessionStore,
   });
   const server = await startRemoteHttpServer({
-    auth: createRemoteTokenAuth(accessToken),
     protocol,
     listenHost: binding.listenHost,
     displayHost,
@@ -43,11 +40,6 @@ export async function runRemoteMode(options: RunRemoteModeOptions): Promise<void
   writeStdoutLine("");
   writeStdoutLine("Open on your phone:");
   writeStdoutLine(server.url);
-  writeStdoutLine("");
-  writeStdoutLine("Access token:");
-  writeStdoutLine(accessToken);
-  writeStdoutLine("");
-  writeStdoutLine("Use the token on first connect.");
   if (!requestedHost && displayHost !== "127.0.0.1" && binding.exposureKind !== "loopback") {
     ui.info(`Auto-detected LAN address: ${displayHost}`);
   }

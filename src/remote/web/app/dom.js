@@ -9,17 +9,9 @@ function requireElement(id) {
 
 export function getElements() {
   return {
-    connectScreen: requireElement("connect-screen"),
-    appScreen: requireElement("app-screen"),
-    connectForm: requireElement("connect-form"),
-    tokenInput: requireElement("token-input"),
-    connectButton: requireElement("connect-button"),
-    connectMessage: requireElement("connect-message"),
     streamPill: requireElement("stream-pill"),
     runPill: requireElement("run-pill"),
-    projectPath: requireElement("project-path"),
     newConversationButton: requireElement("new-conversation-button"),
-    emptyState: requireElement("empty-state"),
     timeline: requireElement("timeline"),
     chatScroll: requireElement("chat-scroll"),
     composerForm: requireElement("composer-form"),

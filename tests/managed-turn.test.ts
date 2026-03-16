@@ -31,7 +31,6 @@ function createConfig(): RuntimeConfig {
       enabled: true,
       host: "",
       port: 4387,
-      token: "",
       bind: "lan",
       publicUrl: "",
     },

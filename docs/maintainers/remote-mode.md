@@ -2,14 +2,24 @@
 
 ## 目标
 
-当前 remote 手机端的目标不是“字符级流式终端镜像”，而是：
+当前 remote 的目标非常明确：
 
-- 手机优先聊天界面
-- 阶段式增量 timeline
-- 已插入卡片只做局部更新
-- Tool use 默认只显示工具名
-- Tool output 默认不把原始 JSON 丢进手机时间线
-- 支持把工作区文件分享成可下载快照
+- 手机优先的聊天界面
+- 直接访问，不做 token 鉴权
+- 只保留聊天核心时间线
+- 支持继续当前对话
+- 支持从空对话重新开始
+- 支持停止当前任务
+
+不要再把 remote 扩展回“远程控制平台”。
+
+明确不做：
+
+- token 登录页
+- 文件分享
+- 文件下载
+- 自动下载卡片
+- 复杂的会话列表页
 
 ## 分层
 
@@ -24,9 +34,8 @@
 
 - 解析 remote 配置
 - 创建 `RemoteControlService`
-- 创建 token auth
 - 启动 HTTP server
-- 打印 LAN URL 和 token
+- 打印访问地址
 
 不要把 remote 业务逻辑塞回 `src/cli.ts`。
 
@@ -34,33 +43,17 @@
 
 文件：
 
-- `src/remote/service.ts`
 - `src/remote/types.ts`
-- `src/remote/sessionViews.ts`
 - `src/remote/timeline.ts`
+- `src/remote/sessionViews.ts`
+- `src/remote/service.ts`
 
 职责：
 
-- 维护 `currentRun`、recent sessions、last session
-- 把 agent callbacks 转成 remote 时间线事件
-- 把历史 session 消息转成适合手机端的 timeline
-- 对 `todo_write` / `remote_share_file` 这种工具做专门的 timeline 视图转换
-
-### 文件分享层
-
-文件：
-
-- `src/remote/fileShares.ts`
-- `src/tools/remote/remoteShareFileTool.ts`
-
-职责：
-
-- 为分享文件生成 shareId
-- 把分享时刻的文件内容保存成快照
-- 为 HTTP 下载接口提供按 shareId 读取的内容
-
-`remote_share_file` 不走任意路径 query 下载。
-HTTP 暴露的是 `/api/files/:shareId`。
+- 定义 remote 协议
+- 把 agent callbacks 转成 remote 时间线
+- 把历史 session 转成适合手机看的时间线
+- 管理 `currentRun` 和 `lastSession`
 
 ### HTTP 暴露层
 
@@ -75,9 +68,8 @@ HTTP 暴露的是 `/api/files/:shareId`。
 - 暴露 `/api/stream`
 - 暴露 `/api/runs`
 - 暴露 `/api/runs/current/cancel`
-- 暴露 `/api/files/:shareId`
 
-HTTP 层只依赖 `RemoteControlProtocol`，不要绕开 service 直连别的模块。
+这里只依赖 `RemoteControlProtocol`，不要直接去拼别的业务细节。
 
 ### 前端资源层
 
@@ -88,9 +80,16 @@ HTTP 层只依赖 `RemoteControlProtocol`，不要绕开 service 直连别的模
 - `src/remote/web/index.html`
 - `src/remote/web/remote.css`
 - `src/remote/web/remote.js`
+- `src/remote/web/app/*.js`
 
-保持 HTML / CSS / JS 分离。
-不要回退成单个超大模板字符串。
+职责：
+
+- 渲染聊天页
+- 自动连接 SSE
+- 维护当前空对话 / 当前会话视图
+- 增量更新时间线 DOM
+
+保持 HTML / CSS / JS 分离，不要退化成一个超大模板字符串。
 
 ## 当前事件模型
 
@@ -101,69 +100,56 @@ remote 仍然使用 SSE，但消费方式是“阶段完成事件”。
 - `user`
 - `reasoning`
 - `tool_use`
-- `todo`
 - `final_answer`
-- `file_share`
-- `status` / `warning` / `error`
+- `status`
+- `warning`
+- `error`
 
 具体策略：
 
-1. 用户提交 prompt 时，先创建 user 卡片
-2. reasoning delta 只在服务端缓冲，等 `onModelWaitStop` 后一次性插入 reasoning 卡片
-3. `onToolCall` 时插入 `tool_use` 卡片，只显示工具名
-4. 工具结束时只更新那张 `tool_use` 卡片的状态
-5. `todo_write` 的结果转成 `todo` 卡片
-6. `remote_share_file` 的结果转成 `file_share` 卡片
-7. assistant delta 只更新 preview，不再推动 timeline
-8. `onAssistantDone` 时一次性插入 `final_answer`
-9. 完成 / 停止 / 失败时插入简洁状态卡片
+1. 用户提交 prompt 时，先插入 `user` 卡片
+2. reasoning delta 只在服务端缓冲，等 `onModelWaitStop` 后一次性插入 `reasoning`
+3. `onToolCall` 时插入 `tool_use` 卡片，只显示工具名和状态
+4. 工具结束时只更新那张 `tool_use` 卡片
+5. assistant delta 不直接推时间线
+6. `onAssistantDone` 时一次性插入 `final_answer`
+7. 完成 / 停止 / 失败时插入简洁状态卡片
 
-## 前端增量渲染约束
+## 会话视图约束
 
-`src/remote/web/remote.js` 当前做法：
+`src/remote/sessionViews.ts` 的目标是把历史消息重新整理成“适合手机看”的时间线：
 
-- timeline 维护一个 `itemId -> DOM node` 映射
-- 新卡片用 append
-- 已有卡片只更新该卡片
-- 只有在切换 session source 或首次 snapshot 时才 reset 整个 timeline
+- user 消息转成 `user`
+- assistant 的 reasoning 转成 `reasoning`
+- assistant 的 tool calls 转成 `tool_use`
+- assistant 的最终文本转成 `final_answer`
+- tool 成功输出默认不进时间线
+- tool 错误只保留简洁错误卡片
 
-禁止再做：
+不要重新把工具参数 JSON 或工具输出 JSON 大段塞回手机页面。
 
-- `replaceChildren(...items.map(...))`
-- 每个 SSE 事件都整条 timeline 重绘
-- assistant / reasoning 的字符级整块反复刷新
+## 前端约束
 
-## 历史 session 视图约束
+当前前端应保持这些约束：
 
-`src/remote/sessionViews.ts` 的目标是把历史消息重新整理成“适合手机看”的 timeline：
+- 页面直接打开就是聊天页
+- 默认是空对话
+- 只有 `新建对话`
+- 只有 `发送` / `停止`
+- 只有在切换会话或收到完整新快照时才整体重绘
+- 其余 SSE 更新尽量只更新单条消息节点
 
-- assistant 带 `tool_calls` 时，只展示 reasoning 和 `tool_use`
-- 最终 assistant 文本转成 `final_answer`
-- 普通工具成功输出默认不进 timeline
-- 工具错误只保留简短错误说明
-- `todo_write` / `remote_share_file` 单独转成结构化卡片
-
-这样回看上一轮会话时，也不会再看到大段工具参数和 JSON 结果。
-
-## 文件分享链路
-
-1. remote service 在创建 runtime tool registry 时，通过 `includeTools` 注入 `remote_share_file`
-2. `remote_share_file` 只允许分享当前工作区内文件
-3. 工具把文件内容保存到 `cacheDir/remote-file-shares`
-4. 工具结果里返回 shareId、文件名、相对路径、大小、下载路径
-5. service 把结果变成 `file_share` timeline item
-6. 手机端下载按钮使用带 token 的 `fetch` 请求 `/api/files/:shareId`
-
-前端不直接拼接磁盘路径。
+不要再加登录页、下载按钮、文件入口或其他偏离聊天主链路的 UI。
 
 ## 测试
 
 `tests/remote-mode.test.ts` 当前覆盖：
 
-- 远程配置读取
+- remote 配置读取
 - 页面静态资源与基础运行
-- SSE 阶段式 timeline 事件
-- 文件分享快照下载
-- 取消当前运行
+- 同一会话继续聊天
+- 新建对话
+- SSE 阶段式时间线
+- 停止当前任务
 
 如果后续改 remote 行为，先更新这里的测试，再改实现。

@@ -1,22 +1,17 @@
-import path from "node:path";
-
-import { runManagedAgentTurn } from "../agent/managedTurn.js";
 import { AgentTurnError, getErrorMessage } from "../agent/errors.js";
+import { runManagedAgentTurn } from "../agent/managedTurn.js";
 import { SessionStore } from "../agent/sessionStore.js";
 import type { AgentCallbacks } from "../agent/types.js";
-import { createRemoteShareFileTool, createRuntimeToolRegistry } from "../tools/index.js";
+import { createRuntimeToolRegistry } from "../tools/index.js";
 import type { ToolRegistry } from "../tools/index.js";
-import type { RuntimeConfig, StoredMessage } from "../types.js";
+import type { RuntimeConfig } from "../types.js";
 import { isAbortError } from "../utils/abort.js";
-import { resolveUserPath } from "../utils/fs.js";
-import { RemoteFileShareStore } from "./fileShares.js";
-import { createRemoteTimelineItem, parseSharedFileOutput, parseTodoToolOutput, summarizeToolError } from "./timeline.js";
-import { toRemoteSessionDetails, toRemoteSessionSummary } from "./sessionViews.js";
+import { writeStdoutLine } from "../utils/stdio.js";
+import { createRemoteTimelineItem, summarizeToolError } from "./timeline.js";
+import { toRemoteSessionDetails } from "./sessionViews.js";
 import type {
   RemoteControlProtocol,
-  RemoteRunEvent,
   RemoteRunSnapshot,
-  RemoteSharedFileDownload,
   RemoteStateSnapshot,
   RemoteStreamEvent,
   RemoteStreamEventPayload,
@@ -27,27 +22,15 @@ import type {
   RemoteTimelineItemState,
 } from "./types.js";
 
-const MAX_REMOTE_EVENTS = 80;
-const MAX_REMOTE_PREVIEW_CHARS = 24_000;
 const MAX_REMOTE_TIMELINE_ITEMS = 240;
 const MAX_REMOTE_TIMELINE_TEXT_CHARS = 32_000;
-const AUTO_SHARE_DOCUMENT_EXTENSIONS = new Set([
-  ".csv",
-  ".docx",
-  ".htm",
-  ".html",
-  ".md",
-  ".pdf",
-  ".rtf",
-  ".tsv",
-  ".txt",
-]);
 
 export interface RemoteControlServiceOptions {
   cwd: string;
   config: RuntimeConfig;
   sessionStore: SessionStore;
   runTurn?: typeof runManagedAgentTurn;
+  writeTerminalLine?: (line: string) => void;
 }
 
 interface ActiveRemoteRun {
@@ -57,14 +40,12 @@ interface ActiveRemoteRun {
   itemCounter: number;
   pendingReasoningText: string;
   currentToolItemId: string | null;
-  currentToolName: string | null;
-  sharedSourcePaths: Set<string>;
 }
 
 export class RemoteControlService implements RemoteControlProtocol {
   private readonly runTurn: typeof runManagedAgentTurn;
+  private readonly writeTerminalLine: (line: string) => void;
   private readonly listeners = new Set<RemoteStreamListener>();
-  private readonly shareStore: RemoteFileShareStore;
   private currentRun: ActiveRemoteRun | null = null;
   private lastSessionId: string | null = null;
   private streamCursor = 0;
@@ -72,22 +53,15 @@ export class RemoteControlService implements RemoteControlProtocol {
 
   constructor(private readonly options: RemoteControlServiceOptions) {
     this.runTurn = options.runTurn ?? runManagedAgentTurn;
-    this.shareStore = new RemoteFileShareStore(
-      path.join(options.config.paths.cacheDir, "remote-file-shares"),
-    );
+    this.writeTerminalLine = options.writeTerminalLine ?? writeStdoutLine;
   }
 
   async getState(): Promise<RemoteStateSnapshot> {
-    const recentSessions = await this.listProjectSessions();
-    const lastSessionId = this.currentRun?.snapshot.sessionId || this.lastSessionId || recentSessions[0]?.id || null;
-    const lastSession = lastSessionId ? await this.getSessionDetails(lastSessionId) : null;
-
     return {
       streamCursor: this.streamCursor,
       projectCwd: this.options.cwd,
       currentRun: this.currentRun ? cloneSnapshot(this.currentRun.snapshot) : null,
-      recentSessions,
-      lastSession,
+      lastSession: await this.getLastSessionDetails(),
     };
   }
 
@@ -117,7 +91,6 @@ export class RemoteControlService implements RemoteControlProtocol {
       status: "running",
       startedAt,
       updatedAt: startedAt,
-      events: [],
       timeline: prepared.timeline.map(cloneTimelineItem),
     };
 
@@ -125,11 +98,9 @@ export class RemoteControlService implements RemoteControlProtocol {
       snapshot,
       controller: new AbortController(),
       promise: Promise.resolve(),
-      itemCounter: 0,
+      itemCounter: snapshot.timeline.length,
       pendingReasoningText: "",
       currentToolItemId: null,
-      currentToolName: null,
-      sharedSourcePaths: new Set(),
     };
 
     this.addTimelineItem(
@@ -148,11 +119,11 @@ export class RemoteControlService implements RemoteControlProtocol {
 
     this.emit({
       type: "run",
-      run: cloneSnapshot(snapshot),
+      run: cloneSnapshot(run.snapshot),
     });
     void this.publishSessionSync();
 
-    return cloneSnapshot(snapshot);
+    return cloneSnapshot(run.snapshot);
   }
 
   async cancelCurrentRun(): Promise<RemoteRunSnapshot | null> {
@@ -167,23 +138,6 @@ export class RemoteControlService implements RemoteControlProtocol {
     this.currentRun.controller.abort();
     await this.currentRun.promise.catch(() => undefined);
     return cloneSnapshot(this.currentRun.snapshot);
-  }
-
-  async getSessionDetails(sessionId: string) {
-    try {
-      const session = await this.options.sessionStore.load(sessionId);
-      if (session.cwd !== this.options.cwd) {
-        return null;
-      }
-
-      return toRemoteSessionDetails(session);
-    } catch {
-      return null;
-    }
-  }
-
-  async getSharedFile(shareId: string): Promise<RemoteSharedFileDownload | null> {
-    return this.shareStore.getSharedFile(shareId);
   }
 
   async stop(): Promise<void> {
@@ -207,10 +161,7 @@ export class RemoteControlService implements RemoteControlProtocol {
     }
 
     if (this.currentRun && this.currentRun.snapshot.status !== "running") {
-      return this.loadPreparedSession(
-        this.currentRun.snapshot.sessionId,
-        this.currentRun.snapshot.timeline,
-      );
+      return this.loadPreparedSession(this.currentRun.snapshot.sessionId);
     }
 
     const continuationSession = await this.loadContinuationSession();
@@ -233,10 +184,7 @@ export class RemoteControlService implements RemoteControlProtocol {
     };
   }
 
-  private async loadPreparedSession(
-    sessionId: string,
-    supplementalTimeline: RemoteTimelineItem[] = [],
-  ): Promise<{
+  private async loadPreparedSession(sessionId: string): Promise<{
     session: Awaited<ReturnType<SessionStore["save"]>>;
     timeline: RemoteTimelineItem[];
   }> {
@@ -244,7 +192,7 @@ export class RemoteControlService implements RemoteControlProtocol {
     const details = toRemoteSessionDetails(session);
     return {
       session,
-      timeline: mergeTimelineItems(details.timeline, supplementalTimeline),
+      timeline: details.timeline.map(cloneTimelineItem),
     };
   }
 
@@ -261,7 +209,7 @@ export class RemoteControlService implements RemoteControlProtocol {
           return session;
         }
       } catch {
-        // ignore missing saved sessions and fall through to recents
+        // ignore missing sessions and fall through to recents
       }
     }
 
@@ -289,26 +237,15 @@ export class RemoteControlService implements RemoteControlProtocol {
         },
       });
 
-      const autoShareMessages = await this.createAutoShareMessages(run, result.changedPaths);
-      let persistedSession = result.session;
-      if (autoShareMessages.length > 0) {
-        persistedSession = await this.options.sessionStore.appendMessages(result.session, autoShareMessages);
-      }
-
       const updatedAt = this.touchRun(run);
       this.flushReasoningItem(run, updatedAt);
       this.finalizeCurrentToolItem(run, updatedAt, "done");
+      this.replaceTimelineWithSession(run, result.session);
       run.snapshot.status = "completed";
       run.snapshot.updatedAt = updatedAt;
       run.snapshot.finishedAt = updatedAt;
       run.snapshot.statusText = "任务已完成";
-      this.lastSessionId = persistedSession.id;
-
-      pushEvent(run.snapshot, {
-        kind: "status",
-        text: "Remote task completed.",
-        createdAt: updatedAt,
-      });
+      this.lastSessionId = result.session.id;
       this.addTimelineItem(run, {
         kind: "status",
         text: "任务已完成，可以继续发送下一条消息。",
@@ -318,6 +255,8 @@ export class RemoteControlService implements RemoteControlProtocol {
         type: "run",
         run: cloneSnapshot(run.snapshot),
       });
+      await this.publishSessionSync();
+      return;
     } catch (error) {
       const updatedAt = this.touchRun(run);
       this.flushReasoningItem(run, updatedAt);
@@ -333,11 +272,6 @@ export class RemoteControlService implements RemoteControlProtocol {
         run.snapshot.status = "cancelled";
         run.snapshot.error = "Task cancelled by remote operator.";
         run.snapshot.statusText = "任务已停止";
-        pushEvent(run.snapshot, {
-          kind: "warning",
-          text: run.snapshot.error,
-          createdAt: updatedAt,
-        });
         this.addTimelineItem(run, {
           kind: "warning",
           text: "任务已停止。",
@@ -355,11 +289,6 @@ export class RemoteControlService implements RemoteControlProtocol {
       run.snapshot.status = "failed";
       run.snapshot.error = getErrorMessage(error);
       run.snapshot.statusText = "任务失败";
-      pushEvent(run.snapshot, {
-        kind: "error",
-        text: run.snapshot.error,
-        createdAt: updatedAt,
-      });
       this.addTimelineItem(run, {
         kind: "error",
         text: run.snapshot.error,
@@ -377,9 +306,7 @@ export class RemoteControlService implements RemoteControlProtocol {
 
   private async getTurnToolRegistry(): Promise<ToolRegistry> {
     if (!this.toolRegistryPromise) {
-      this.toolRegistryPromise = createRuntimeToolRegistry(this.options.config, {
-        includeTools: [createRemoteShareFileTool(this.shareStore)],
-      });
+      this.toolRegistryPromise = createRuntimeToolRegistry(this.options.config);
     }
 
     return this.toolRegistryPromise;
@@ -401,23 +328,16 @@ export class RemoteControlService implements RemoteControlProtocol {
           run: cloneSnapshot(run.snapshot),
         });
       },
-      onAssistantDelta: (delta) => {
-        run.snapshot.assistantPreview = appendPreview(run.snapshot.assistantPreview, delta);
+      onAssistantDelta: () => {
         this.touchRun(run);
       },
-      onAssistantText: (text) => {
-        run.snapshot.assistantPreview = truncatePreview(text);
+      onAssistantText: () => {
         this.touchRun(run);
       },
       onAssistantDone: (fullText) => {
         const now = this.touchRun(run);
         this.flushReasoningItem(run, now);
-        run.snapshot.assistantPreview = truncatePreview(fullText);
-        pushEvent(run.snapshot, {
-          kind: "final_answer",
-          text: truncateForEvent(fullText),
-          createdAt: now,
-        });
+        this.writeFinalAnswer(fullText);
         this.addTimelineItem(run, {
           kind: "final_answer",
           text: truncateTimelineText(fullText),
@@ -425,7 +345,6 @@ export class RemoteControlService implements RemoteControlProtocol {
         });
       },
       onReasoningDelta: (delta) => {
-        run.snapshot.reasoningPreview = appendPreview(run.snapshot.reasoningPreview, delta);
         if (this.options.config.showReasoning) {
           run.pendingReasoningText = appendTimelineText(
             run.pendingReasoningText,
@@ -437,7 +356,6 @@ export class RemoteControlService implements RemoteControlProtocol {
       },
       onReasoning: (text) => {
         const now = this.touchRun(run);
-        run.snapshot.reasoningPreview = truncatePreview(text);
         if (!this.options.config.showReasoning) {
           run.pendingReasoningText = "";
           return;
@@ -450,12 +368,7 @@ export class RemoteControlService implements RemoteControlProtocol {
         const now = this.touchRun(run);
         this.flushReasoningItem(run, now);
         this.finalizeCurrentToolItem(run, now, "done");
-
-        pushEvent(run.snapshot, {
-          kind: "tool_call",
-          text: name,
-          createdAt: now,
-        });
+        this.writeToolLine(name);
 
         const item = this.addTimelineItem(run, {
           kind: "tool_use",
@@ -463,138 +376,26 @@ export class RemoteControlService implements RemoteControlProtocol {
           createdAt: now,
           toolName: name,
           state: "streaming",
-          summary: "执行中",
+          summary: "运行中",
           collapsed: true,
         });
         run.currentToolItemId = item.id;
-        run.currentToolName = name;
       },
-      onToolResult: (name, output) => {
+      onToolResult: (_name, _output) => {
         const now = this.touchRun(run);
         this.finalizeCurrentToolItem(run, now, "done");
-        pushEvent(run.snapshot, {
-          kind: name === "todo_write" ? "todo" : name === "remote_share_file" ? "file_share" : "tool_result",
-          text: name,
-          createdAt: now,
-        });
-
-        if (name === "todo_write") {
-          const todo = parseTodoToolOutput(output);
-          if (todo) {
-            this.addTimelineItem(run, {
-              kind: "todo",
-              text: truncateTimelineText(todo.details),
-              createdAt: now,
-              summary: todo.summary,
-              collapsed: true,
-              todoItems: todo.items,
-            });
-          }
-          return;
-        }
-
-        if (name === "remote_share_file") {
-          const sharedFile = parseSharedFileOutput(output);
-          if (sharedFile) {
-            this.trackSharedSourcePath(run, sharedFile.relativePath);
-          }
-          if (sharedFile) {
-            this.addTimelineItem(run, {
-              kind: "file_share",
-              text: "文件已准备好，点下载即可获取当时分享的快照。",
-              createdAt: now,
-              summary: "文件已准备好",
-              file: sharedFile,
-            });
-          }
-        }
       },
       onToolError: (name, error) => {
         const now = this.touchRun(run);
         this.finalizeCurrentToolItem(run, now, "error");
-        const summary = summarizeToolError(error, name);
-        pushEvent(run.snapshot, {
-          kind: "tool_error",
-          text: summary,
-          createdAt: now,
-        });
         this.addTimelineItem(run, {
           kind: "error",
-          text: summary,
+          text: summarizeToolError(error, name),
           createdAt: now,
           state: "error",
         });
       },
     };
-  }
-
-  private async createAutoShareMessages(run: ActiveRemoteRun, changedPaths: string[]): Promise<StoredMessage[]> {
-    const toolMessages: StoredMessage[] = [];
-
-    for (const sourcePath of collectAutoShareCandidates(changedPaths, this.options.cwd)) {
-      const normalizedSourcePath = path.normalize(sourcePath);
-      if (run.sharedSourcePaths.has(normalizedSourcePath)) {
-        continue;
-      }
-
-      try {
-        const sharedFile = await this.shareStore.createShare({
-          sourcePath: normalizedSourcePath,
-          cwd: this.options.cwd,
-        });
-        const createdAt = this.touchRun(run);
-        run.sharedSourcePaths.add(normalizedSourcePath);
-        pushEvent(run.snapshot, {
-          kind: "file_share",
-          text: sharedFile.fileName,
-          createdAt,
-        });
-        this.addSharedFileTimelineItem(run, sharedFile, createdAt);
-        toolMessages.push({
-          role: "tool",
-          name: "remote_share_file",
-          content: serializeSharedFileSummary(sharedFile),
-          createdAt,
-        });
-      } catch (error) {
-        const createdAt = this.touchRun(run);
-        const message = `Failed to prepare ${path.basename(normalizedSourcePath)} for download: ${getErrorMessage(error)}`;
-        pushEvent(run.snapshot, {
-          kind: "warning",
-          text: message,
-          createdAt,
-        });
-        this.addTimelineItem(run, {
-          kind: "warning",
-          text: message,
-          createdAt,
-        });
-      }
-    }
-
-    return toolMessages;
-  }
-
-  private trackSharedSourcePath(run: ActiveRemoteRun, relativePath: string): void {
-    if (!relativePath.trim()) {
-      return;
-    }
-
-    run.sharedSourcePaths.add(path.normalize(resolveUserPath(relativePath, this.options.cwd)));
-  }
-
-  private addSharedFileTimelineItem(
-    run: ActiveRemoteRun,
-    sharedFile: NonNullable<RemoteTimelineItem["file"]>,
-    createdAt: string,
-  ): void {
-    this.addTimelineItem(run, {
-      kind: "file_share",
-      text: "File is ready to download from this remote session.",
-      createdAt,
-      summary: "File is ready",
-      file: sharedFile,
-    });
   }
 
   private flushReasoningItem(run: ActiveRemoteRun, createdAt: string): void {
@@ -629,7 +430,14 @@ export class RemoteControlService implements RemoteControlProtocol {
       updatedAt,
     }));
     run.currentToolItemId = null;
-    run.currentToolName = null;
+  }
+
+  private replaceTimelineWithSession(
+    run: ActiveRemoteRun,
+    session: Awaited<ReturnType<SessionStore["save"]>>,
+  ): void {
+    const details = toRemoteSessionDetails(session);
+    run.snapshot.timeline = details.timeline.map(cloneTimelineItem).slice(-MAX_REMOTE_TIMELINE_ITEMS);
   }
 
   private addTimelineItem(
@@ -642,8 +450,6 @@ export class RemoteControlService implements RemoteControlProtocol {
       state?: RemoteTimelineItemState;
       summary?: string;
       collapsed?: boolean;
-      todoItems?: RemoteTimelineItem["todoItems"];
-      file?: RemoteTimelineItem["file"];
     },
     options: { emit?: boolean } = {},
   ): RemoteTimelineItem {
@@ -656,8 +462,6 @@ export class RemoteControlService implements RemoteControlProtocol {
       state: input.state ?? "done",
       summary: input.summary,
       collapsed: input.collapsed,
-      todoItems: input.todoItems,
-      file: input.file,
     });
     run.snapshot.timeline = [...run.snapshot.timeline, item].slice(-MAX_REMOTE_TIMELINE_ITEMS);
 
@@ -681,7 +485,6 @@ export class RemoteControlService implements RemoteControlProtocol {
     if (index < 0) {
       if (run.currentToolItemId === itemId) {
         run.currentToolItemId = null;
-        run.currentToolName = null;
       }
       return;
     }
@@ -723,49 +526,58 @@ export class RemoteControlService implements RemoteControlProtocol {
   }
 
   private async publishSessionSync(): Promise<void> {
-    const recentSessions = await this.listProjectSessions();
-    const lastSessionId = this.currentRun?.snapshot.sessionId || this.lastSessionId || recentSessions[0]?.id || null;
-    const lastSession = lastSessionId ? await this.getSessionDetails(lastSessionId) : null;
-
     this.emit({
       type: "session",
-      recentSessions,
-      lastSession,
+      lastSession: await this.getLastSessionDetails(),
     });
   }
 
-  private async listProjectSessions() {
-    const sessions = await this.options.sessionStore.list(50);
-    return sessions
-      .filter((session) => session.cwd === this.options.cwd)
-      .slice(0, 8)
-      .map(toRemoteSessionSummary);
-  }
-}
+  private writeToolLine(name: string): void {
+    const normalizedName = name.trim();
+    if (!normalizedName) {
+      return;
+    }
 
-function pushEvent(snapshot: RemoteRunSnapshot, event: RemoteRunEvent): void {
-  snapshot.events = [...snapshot.events, event].slice(-MAX_REMOTE_EVENTS);
-}
-
-function appendPreview(current: string | undefined, delta: string): string {
-  return truncatePreview(`${current ?? ""}${delta}`);
-}
-
-function truncatePreview(value: string): string {
-  if (value.length <= MAX_REMOTE_PREVIEW_CHARS) {
-    return value;
+    this.writeTerminalLine(`[remote] Tool: ${normalizedName}`);
   }
 
-  return `${value.slice(-MAX_REMOTE_PREVIEW_CHARS)}\n\n... [older preview truncated]`;
-}
+  private writeFinalAnswer(fullText: string): void {
+    const normalized = fullText.trim();
+    if (!normalized) {
+      return;
+    }
 
-function truncateForEvent(value: string): string {
-  const normalized = value.replace(/\s+/g, " ").trim();
-  if (normalized.length <= 240) {
-    return normalized;
+    if (!normalized.includes("\n")) {
+      this.writeTerminalLine(`[remote] Final: ${normalized}`);
+      return;
+    }
+
+    this.writeTerminalLine("[remote] Final:");
+    for (const line of normalized.split(/\r?\n/)) {
+      this.writeTerminalLine(line);
+    }
   }
 
-  return `${normalized.slice(0, 240)}...`;
+  private async getLastSessionDetails() {
+    const preferredIds = [
+      this.currentRun?.snapshot.sessionId ?? null,
+      this.lastSessionId,
+    ].filter((value): value is string => Boolean(value));
+
+    for (const sessionId of preferredIds) {
+      try {
+        const session = await this.options.sessionStore.load(sessionId);
+        if (session.cwd === this.options.cwd) {
+          return toRemoteSessionDetails(session);
+        }
+      } catch {
+        // ignore missing sessions and fall through to the latest persisted one
+      }
+    }
+
+    const fallback = await this.loadContinuationSession();
+    return fallback ? toRemoteSessionDetails(fallback) : null;
+  }
 }
 
 function appendTimelineText(current: string, delta: string, maxChars: number): string {
@@ -787,7 +599,6 @@ function truncateTimelineText(value: string): string {
 function cloneSnapshot(snapshot: RemoteRunSnapshot): RemoteRunSnapshot {
   return {
     ...snapshot,
-    events: [...snapshot.events],
     timeline: snapshot.timeline.map(cloneTimelineItem),
   };
 }
@@ -795,79 +606,5 @@ function cloneSnapshot(snapshot: RemoteRunSnapshot): RemoteRunSnapshot {
 function cloneTimelineItem(item: RemoteTimelineItem): RemoteTimelineItem {
   return {
     ...item,
-    todoItems: item.todoItems ? item.todoItems.map((todo) => ({ ...todo })) : undefined,
-    file: item.file ? { ...item.file } : undefined,
   };
-}
-
-function mergeTimelineItems(
-  baseItems: RemoteTimelineItem[],
-  supplementalItems: RemoteTimelineItem[],
-): RemoteTimelineItem[] {
-  const itemMap = new Map<string, RemoteTimelineItem>();
-  const orderedIds: string[] = [];
-
-  for (const item of [...baseItems, ...supplementalItems]) {
-    if (!item?.id) {
-      continue;
-    }
-
-    if (!itemMap.has(item.id)) {
-      orderedIds.push(item.id);
-    }
-
-    itemMap.set(item.id, cloneTimelineItem(item));
-  }
-
-  return orderedIds
-    .map((id) => itemMap.get(id))
-    .filter((item): item is RemoteTimelineItem => Boolean(item))
-    .slice(-MAX_REMOTE_TIMELINE_ITEMS);
-}
-
-function collectAutoShareCandidates(changedPaths: string[], cwd: string): string[] {
-  const candidates: string[] = [];
-  const seen = new Set<string>();
-
-  for (const changedPath of changedPaths) {
-    const normalizedPath = path.normalize(changedPath);
-    if (seen.has(normalizedPath)) {
-      continue;
-    }
-
-    seen.add(normalizedPath);
-
-    const relativePath = path.relative(cwd, normalizedPath);
-    if (!relativePath || relativePath.startsWith("..") || path.isAbsolute(relativePath)) {
-      continue;
-    }
-
-    if (!shouldAutoSharePath(relativePath)) {
-      continue;
-    }
-
-    candidates.push(normalizedPath);
-  }
-
-  return candidates;
-}
-
-function shouldAutoSharePath(relativePath: string): boolean {
-  return AUTO_SHARE_DOCUMENT_EXTENSIONS.has(path.extname(relativePath).toLowerCase());
-}
-
-function serializeSharedFileSummary(sharedFile: NonNullable<RemoteTimelineItem["file"]>): string {
-  return JSON.stringify(
-    {
-      ok: true,
-      shareId: sharedFile.shareId,
-      fileName: sharedFile.fileName,
-      relativePath: sharedFile.relativePath,
-      size: sharedFile.size,
-      createdAt: sharedFile.createdAt,
-      downloadPath: sharedFile.downloadPath,
-    },
-    null,
-    2,
-  );
 }

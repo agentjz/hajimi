@@ -4,71 +4,42 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="theme-color" content="#d7efff" />
-    <title>哈基米聊天</title>
+    <title>哈基米远程</title>
     <link rel="stylesheet" href="/assets/remote.css" />
     <script type="module" src="/assets/remote.js"></script>
   </head>
   <body>
     <div class="page-shell">
-      <section class="connect-screen" id="connect-screen">
-        <div class="connect-card">
-          <div class="brand-mark">哈基米</div>
-          <h1>连上就能聊</h1>
-          <p class="connect-copy">
-            输入终端里显示的访问令牌。连上以后，就能像普通聊天一样接着当前对话继续聊，文件也能直接收下来。
-          </p>
-
-          <form class="connect-form" id="connect-form">
-            <label for="token-input">访问令牌</label>
-            <input
-              id="token-input"
-              type="password"
-              autocomplete="off"
-              placeholder="输入访问令牌"
-            />
-            <button class="primary-button" id="connect-button" type="submit">进入聊天</button>
-          </form>
-
-          <p class="connect-message" id="connect-message">等待连接。</p>
-        </div>
-      </section>
-
-      <main class="app-screen hidden" id="app-screen">
-        <header class="app-header">
-          <p class="project-path" id="project-path">准备聊天目录中...</p>
+      <header class="app-header">
+        <div class="header-actions">
+          <span class="pill" id="stream-pill">连接中</span>
+          <span class="pill accent" id="run-pill">空闲</span>
           <button class="topbar-button" id="new-conversation-button" type="button">新建对话</button>
-        </header>
+        </div>
+      </header>
 
-        <section class="chat-shell">
-          <div class="chat-scroll" id="chat-scroll">
-            <div class="empty-state" id="empty-state">
-              <p class="empty-title">今天想聊点什么？</p>
-              <p>发出第一条消息，这段对话就开始了。</p>
-              <p>后面的回复会顺着这段对话继续往下聊。</p>
-            </div>
-            <div class="timeline" id="timeline"></div>
-          </div>
+      <main class="chat-shell">
+        <div class="chat-scroll" id="chat-scroll">
+          <div class="timeline" id="timeline"></div>
+        </div>
 
-          <form class="composer" id="composer-form">
-            <textarea
-              id="prompt-input"
-              rows="1"
-              aria-label="消息输入框"
-              placeholder="发消息..."
-            ></textarea>
+        <form class="composer" id="composer-form">
+          <textarea
+            id="prompt-input"
+            rows="1"
+            aria-label="消息输入框"
+            placeholder="发送消息..."
+          ></textarea>
+
+          <div class="composer-bar">
+            <p class="composer-note" id="composer-note">正在连接远程聊天页...</p>
+
             <div class="composer-actions">
-              <button class="primary-button" id="send-button" type="submit">发送</button>
               <button class="secondary-button" id="stop-button" type="button">停止</button>
+              <button class="primary-button" id="send-button" type="submit">发送</button>
             </div>
-            <div class="composer-statusbar">
-              <p class="composer-note" id="composer-note">连上以后，就能在这里继续聊。</p>
-              <div class="composer-pills">
-                <span class="pill" id="stream-pill">未连接</span>
-                <span class="pill accent" id="run-pill">空闲</span>
-              </div>
-            </div>
-          </form>
-        </section>
+          </div>
+        </form>
       </main>
     </div>
   </body>
